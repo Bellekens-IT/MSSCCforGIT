@@ -1,0 +1,23 @@
+﻿<Project Sdk="Microsoft.NET.Sdk">
+	<PropertyGroup>
+		<TargetFramework>net10.0</TargetFramework>
+		<ImplicitUsings>enable</ImplicitUsings>
+		<Nullable>enable</Nullable>
+		<AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+		<!-- Compiles directly to native machine code without requiring a .NET runtime installation -->
+		<PublishAot>true</PublishAot>
+		<RuntimeIdentifier>win-x86</RuntimeIdentifier>
+	</PropertyGroup>
+	<ItemGroup>
+	  <PackageReference Include="LibGit2Sharp" Version="0.32.0" />
+	</ItemGroup>
+
+	<!--
+	  Automatically produce the native AOT DLL after a Release build so the output used by
+	  EA (bin\Release\net10.0\win-x86\publish\MSSCCforGIT.dll) is always up to date.
+	  Runs `dotnet publish` as an external process to avoid recursive MSBuild invocation.
+	-->
+	<Target Name="PublishNativeAot" AfterTargets="Build" Condition="'$(Configuration)' == 'Release' AND '$(_IsPublishing)' != 'true'">
+		<Exec Command="dotnet publish &quot;$(MSBuildProjectFullPath)&quot; -c $(Configuration) -r $(RuntimeIdentifier) --self-contained -p:_IsPublishing=true" />
+	</Target>
+</Project>

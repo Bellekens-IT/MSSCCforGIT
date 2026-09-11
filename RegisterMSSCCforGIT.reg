@@ -1,0 +1,14 @@
+Windows Registry Editor Version 5.00
+
+; Registers the Git Native MSSCCI provider so Sparx EA (32-bit) can find and use it.
+; This targets the WOW6432Node hive, which is where 32-bit apps on 64-bit Windows look
+; for SOFTWARE\SourceCodeControlProvider entries.
+;
+; If you are running 32-bit Windows (not WOW64), remove the "WOW6432Node\" segment
+; from both key paths below.
+
+[HKEY_LOCAL_MACHINE\SOFTWARE\WOW6432Node\SourceCodeControlProvider\InstalledSCCProviders]
+"Git Native MSSCCI"="SOFTWARE\\SourceCodeControlProvider\\Git Native MSSCCI"
+
+[HKEY_LOCAL_MACHINE\SOFTWARE\WOW6432Node\SourceCodeControlProvider\Git Native MSSCCI]
+"SCCServerPath"="C:\\Users\\geert\\Documents\\GitHub\\MSSCCforGIT\\bin\\Release\\net10.0\\win-x86\\publish\\MSSCCforGIT.dll"
