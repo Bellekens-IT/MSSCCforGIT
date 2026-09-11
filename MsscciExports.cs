@@ -199,8 +199,8 @@ public static class MsscciExports
     {
         try
         {
-            string comment = lpComment != null ? ReadMfcCStringOrAnsi((IntPtr)lpComment) : "EA Checkin";
-            if (string.IsNullOrEmpty(comment)) comment = "EA Checkin";
+            string comment = lpComment != null ? ReadPlainAnsiString((IntPtr)lpComment) : "EA Checkin";
+            if (string.IsNullOrWhiteSpace(comment)) comment = "EA Checkin";
 
             LogDiagnostic("SccCheckin.Entry", new Exception($"nFiles={nFiles} comment='{comment}' fOptions={fOptions}"));
 
@@ -258,8 +258,14 @@ public static class MsscciExports
             comment = "EA commit";
         }
 
-        Signature author = repo.Config.BuildSignature(DateTimeOffset.Now) ?? GetFallbackSignature(repo);
-        repo.Commit(comment, author, author);
+        // Commit via the "git" CLI rather than LibGit2Sharp's Repository.Commit. Diagnostics
+        // showed the comment string is intact right up until the LibGit2Sharp call (PreCommit log),
+        // but the resulting commit object always ends up with an empty message (confirmed via
+        // "git cat-file -p" on the raw commit). This points to LibGit2Sharp's commit-message
+        // marshaling (it uses a custom ICustomMarshaler internally) not working correctly under
+        // NativeAOT, which doesn't support reflection-based custom marshalers. The git CLI, which
+        // we already use for push for a similar interop reason, sidesteps this entirely.
+        CommitViaGitCli(repo.Info.WorkingDirectory, comment);
 
         // 3. Push to default remote, if one is configured. A brand-new local-only
         // repository won't have a remote, so pushing is skipped rather than failing.
@@ -267,6 +273,42 @@ public static class MsscciExports
         if (remote != null)
         {
             PushViaGitCli(repo.Info.WorkingDirectory);
+        }
+    }
+
+    /// <summary>
+    /// Commits currently-staged changes using the system "git" CLI rather than LibGit2Sharp's
+    /// Repository.Commit, since the latter's commit-message marshaling does not survive under
+    /// NativeAOT (see StageCommitAndPush for details).
+    /// </summary>
+    private static void CommitViaGitCli(string workingDirectory, string comment)
+    {
+        var psi = new System.Diagnostics.ProcessStartInfo
+        {
+            FileName = "git",
+            ArgumentList = { "commit", "-m", comment },
+            WorkingDirectory = workingDirectory,
+            UseShellExecute = false,
+            CreateNoWindow = true,
+            RedirectStandardOutput = true,
+            RedirectStandardError = true,
+        };
+
+        using var process = System.Diagnostics.Process.Start(psi);
+        if (process == null)
+        {
+            throw new InvalidOperationException("Failed to start 'git commit' process.");
+        }
+
+        string stdout = process.StandardOutput.ReadToEnd();
+        string stderr = process.StandardError.ReadToEnd();
+        process.WaitForExit(30000);
+
+        LogDiagnostic("CommitViaGitCli", new Exception($"exitCode={process.ExitCode} stdout='{stdout}' stderr='{stderr}'"));
+
+        if (process.ExitCode != 0)
+        {
+            throw new InvalidOperationException($"'git commit' failed with exit code {process.ExitCode}: {stderr}");
         }
     }
 
@@ -427,8 +469,8 @@ public static class MsscciExports
         int* pFlags,
         int fOptions)
     {
-        string comment = lpComment != null ? ReadMfcCStringOrAnsi((IntPtr)lpComment) : "EA Add";
-        if (string.IsNullOrEmpty(comment)) comment = "EA Add";
+        string comment = lpComment != null ? ReadPlainAnsiString((IntPtr)lpComment) : "EA Add";
+        if (string.IsNullOrWhiteSpace(comment)) comment = "EA Add";
 
         return AddCore(nFiles, lpFileNames, pContext, comment);
     }
@@ -690,6 +732,19 @@ public static class MsscciExports
         }
 
         return filePath;
+    }
+
+    /// <summary>
+    /// Reads a plain, straightforward null-terminated ANSI string (e.g. a comment). Unlike file
+    /// name pointers, EA passes comment pointers directly (confirmed via diagnostics showing
+    /// correctly-decoded comments at offset 0), so the path-scanning heuristic in
+    /// ReadMfcCStringOrAnsi must NOT be used here: it can pick up an unrelated path-like string
+    /// from adjacent memory instead of the actual (possibly short/blank) comment text.
+    /// </summary>
+    private static unsafe string ReadPlainAnsiString(IntPtr rawPtr)
+    {
+        if (rawPtr == IntPtr.Zero) return "";
+        return Marshal.PtrToStringAnsi(rawPtr) ?? "";
     }
 
     /// <summary>
@@ -1070,8 +1125,8 @@ public static class MsscciExports
         int* pFlags,
         int fOptions)
     {
-        string comment = lpComment != null ? ReadMfcCStringOrAnsi((IntPtr)lpComment) : "EA Add";
-        if (string.IsNullOrEmpty(comment)) comment = "EA Add";
+        string comment = lpComment != null ? ReadPlainAnsiString((IntPtr)lpComment) : "EA Add";
+        if (string.IsNullOrWhiteSpace(comment)) comment = "EA Add";
         return AddCore(nFiles, lpFileNames, pContext, comment);
     }
 
@@ -1085,8 +1140,8 @@ public static class MsscciExports
         int* pFlags,
         int fOptions)
     {
-        string comment = lpComment != null ? ReadMfcCStringOrAnsi((IntPtr)lpComment) : "EA Add";
-        if (string.IsNullOrEmpty(comment)) comment = "EA Add";
+        string comment = lpComment != null ? ReadPlainAnsiString((IntPtr)lpComment) : "EA Add";
+        if (string.IsNullOrWhiteSpace(comment)) comment = "EA Add";
         return AddCore(nFiles, lpFileNames, pContext, comment);
     }
 
