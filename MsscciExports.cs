@@ -114,6 +114,9 @@ public static class MsscciExports
     [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
     private static extern bool SetDllDirectory(string lpPathName);
 
+    [DllImport("user32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+    private static extern int MessageBoxW(IntPtr hWnd, string lpText, string lpCaption, uint uType);
+
     /// <summary>
     /// EA calls this first to get the MSSCCI spec version supported (e.g., version 1.3 -> 0x00010300).
     /// </summary>
@@ -1029,7 +1032,9 @@ public static class MsscciExports
     }
 
     /// <summary>
-    /// Shows revision history for one or more files. Not yet implemented.
+    /// Shows revision history for one or more files. There's no dedicated MSSCCI history UI
+    /// callback for us to populate, so we shell out to "git log" for each file's relative path and
+    /// display the resulting log text in a simple message box owned by EA's window.
     /// </summary>
     [UnmanagedCallersOnly(EntryPoint = "SccHistory", CallConvs = new[] { typeof(CallConvStdcall) })]
     public static unsafe int SccHistory(
@@ -1039,7 +1044,74 @@ public static class MsscciExports
         sbyte** lpFileNames,
         int fOptions)
     {
-        return SCC_E_OPNOTPERFORMED;
+        try
+        {
+            var sb = new System.Text.StringBuilder();
+
+            for (int i = 0; i < nFiles; i++)
+            {
+                string filePath = ResolveEaPath(ReadMfcCStringOrAnsi((IntPtr)lpFileNames[i]), pContext);
+
+                string? repoPath = DiscoverRepositoryPath(filePath);
+                LogDiagnostic("SccHistory", new Exception($"filePath='{filePath}' repoPath='{repoPath}'"));
+                if (repoPath == null) continue;
+
+                using var repo = OpenRepositoryEnsuringSafeDirectory(repoPath);
+                string relativePath = GetRelativePath(repo, filePath);
+
+                if (sb.Length > 0) sb.AppendLine().AppendLine();
+                sb.AppendLine($"History for {relativePath}:");
+                sb.Append(GetFileHistoryViaGitCli(repo.Info.WorkingDirectory, relativePath));
+            }
+
+            string historyText = sb.Length > 0 ? sb.ToString() : "No history available.";
+            MessageBoxW(hWnd, historyText, "File History", 0);
+
+            return SCC_OK;
+        }
+        catch (Exception ex)
+        {
+            LogDiagnostic("SccHistory", ex);
+            return SCC_E_UNKNOWNERROR;
+        }
+    }
+
+    /// <summary>
+    /// Runs "git log" for a single file (relative to the repo working directory) and returns its
+    /// stdout text, using the same git-CLI approach as commit/push to sidestep LibGit2Sharp
+    /// interop issues under NativeAOT.
+    /// </summary>
+    private static string GetFileHistoryViaGitCli(string workingDirectory, string relativePath)
+    {
+        var psi = new System.Diagnostics.ProcessStartInfo
+        {
+            FileName = "git",
+            ArgumentList = { "log", "--follow", "--date=short", "--pretty=format:%h %ad %an: %s", "--", relativePath },
+            WorkingDirectory = workingDirectory,
+            UseShellExecute = false,
+            CreateNoWindow = true,
+            RedirectStandardOutput = true,
+            RedirectStandardError = true,
+        };
+
+        using var process = System.Diagnostics.Process.Start(psi);
+        if (process == null)
+        {
+            return "(failed to start 'git log')";
+        }
+
+        string stdout = process.StandardOutput.ReadToEnd();
+        string stderr = process.StandardError.ReadToEnd();
+        process.WaitForExit(30000);
+
+        LogDiagnostic("GetFileHistoryViaGitCli", new Exception($"exitCode={process.ExitCode} stdout='{stdout}' stderr='{stderr}'"));
+
+        if (process.ExitCode != 0)
+        {
+            return $"(error: {stderr})";
+        }
+
+        return string.IsNullOrWhiteSpace(stdout) ? "(no history)" : stdout;
     }
 
     /// <summary>
