@@ -2,6 +2,7 @@ using LibGit2Sharp;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using System.Linq;
+using System.Collections.Generic;
 
 namespace MSSCCforGIT;
 
@@ -28,6 +29,70 @@ public static class MsscciExports
     private const int SCC_STATUS_NOTINPROJECT = 0x0200;
 
     private static bool s_nativeDllDirectoryInitialized;
+
+    /// <summary>
+    /// Debounced-commit state: EA never actually calls SccBeginBatch/SccEndBatch around a
+    /// multi-file "checkin branch" operation (confirmed empirically - zero occurrences logged even
+    /// with diagnostics added to both), it simply calls SccCheckin repeatedly in quick succession,
+    /// once per selected file. To still produce a single combined commit+push for such a batch, we
+    /// accumulate staged files per repo and (re)schedule a delayed flush on every SccCheckin call;
+    /// if another SccCheckin arrives before the delay elapses, the timer is reset and that file
+    /// joins the same pending commit. EA also calls SccQueryInfo immediately after every single
+    /// SccCheckin (even mid-batch) purely to refresh each file's status icon, so that specific call
+    /// only extends the debounce window rather than flushing - it is not a sign EA has moved on.
+    /// Any OTHER Scc* call (SccAdd, SccCheckout, SccGet, SccRemove, SccRename, SccUncheckout,
+    /// SccHistory) arriving while a batch is pending means EA has finished this checkin operation
+    /// and started doing something else, so the pending batch is flushed immediately at that point
+    /// rather than waiting for the debounce window to elapse.
+    /// </summary>
+    private static readonly object s_pendingCheckinLock = new();
+    private static readonly Dictionary<string, List<string>> s_pendingFilesByRepo = new(StringComparer.OrdinalIgnoreCase);
+    private static string? s_pendingComment;
+    private static System.Threading.Timer? s_pendingCheckinTimer;
+    private static readonly TimeSpan PendingCheckinDebounce = TimeSpan.FromSeconds(5);
+
+    /// <summary>
+    /// Resets the pending-checkin debounce timer if a batch is currently accumulating. Called only
+    /// from SccQueryInfo, since EA issuing that call right after SccCheckin is a routine per-file
+    /// status refresh rather than a sign EA has moved on to a different operation.
+    /// </summary>
+    private static void ExtendPendingCheckinTimerIfActive()
+    {
+        lock (s_pendingCheckinLock)
+        {
+            if (s_pendingFilesByRepo.Count == 0 || s_pendingCheckinTimer == null) return;
+
+            s_pendingCheckinTimer.Change(PendingCheckinDebounce, System.Threading.Timeout.InfiniteTimeSpan);
+        }
+    }
+
+    /// <summary>
+    /// Immediately flushes (commits+pushes) any pending checkin batch, if one is accumulating. Called
+    /// from every Scc* entry point other than SccCheckin/SccQueryInfo, since EA calling any of those
+    /// while a batch is pending means it has finished the checkin operation and moved on to
+    /// something else - so the pending batch should not wait out the debounce window any longer.
+    /// Safe to call unconditionally; it is a no-op when no batch is pending.
+    /// </summary>
+    private static void FlushPendingCheckinsNowIfActive()
+    {
+        Dictionary<string, List<string>>? filesByRepo = null;
+        string? comment = null;
+
+        lock (s_pendingCheckinLock)
+        {
+            if (s_pendingFilesByRepo.Count == 0) return;
+
+            filesByRepo = new Dictionary<string, List<string>>(s_pendingFilesByRepo, StringComparer.OrdinalIgnoreCase);
+            comment = s_pendingComment;
+
+            s_pendingFilesByRepo.Clear();
+            s_pendingComment = null;
+            s_pendingCheckinTimer?.Dispose();
+            s_pendingCheckinTimer = null;
+        }
+
+        CommitAndPushFiles(filesByRepo, comment ?? "EA Checkin");
+    }
 
     /// <summary>
     /// Caches the repository root path established by SccOpenProject, keyed by the pContext EA
@@ -207,35 +272,86 @@ public static class MsscciExports
 
             LogDiagnostic("SccCheckin.Entry", new Exception($"nFiles={nFiles} comment='{comment}' fOptions={fOptions}"));
 
-            bool anyFileFailed = false;
+            // Group files by repo first so that a multi-file checkin (e.g. "checkin branch",
+            // which selects every changed package under a branch at once) results in a single
+            // commit + push per repo, rather than one commit+push per individual file. EA doesn't
+            // distinguish between these at the SCC level - it just calls SccCheckin once with all
+            // selected files - so combining them here matches the "one commit for this checkin"
+            // expectation a user has when checking in a whole branch.
+            var filesByRepo = new Dictionary<string, List<string>>(StringComparer.OrdinalIgnoreCase);
 
             for (int i = 0; i < nFiles; i++)
             {
                 string filePath = ResolveEaPath(ReadPlainAnsiString((IntPtr)lpFileNames[i]), pContext);
 
-                try
-                {
-                    // Find local git repo root from the package path
-                    string? repoPath = DiscoverRepositoryPath(filePath);
-                    LogDiagnostic("SccCheckin", new Exception($"filePath='{filePath}' repoPath='{repoPath}'"));
-                    if (repoPath == null) continue;
+                string? repoPath = DiscoverRepositoryPath(filePath);
+                LogDiagnostic("SccCheckin", new Exception($"filePath='{filePath}' repoPath='{repoPath}'"));
+                if (repoPath == null) continue;
 
-                    using var repo = OpenRepositoryEnsuringSafeDirectory(repoPath);
-                    StageCommitAndPush(repo, filePath, comment);
-                }
-                catch (Exception ex)
+                if (!filesByRepo.TryGetValue(repoPath, out List<string>? files))
                 {
-                    // A failure on one file (e.g. a transient git/network error) must not abort the
-                    // rest of the batch - EA calls SccCheckin once per selected package/file, and
-                    // previously a single failure here caused the whole loop (and every remaining
-                    // file in the batch) to be skipped, with EA reporting SCC_E_INITIALIZEFAILED and
-                    // leaving all of them stuck as "checked out" even though most had no real issue.
-                    LogDiagnostic("SccCheckin", ex);
-                    anyFileFailed = true;
+                    files = new List<string>();
+                    filesByRepo[repoPath] = files;
                 }
+                files.Add(filePath);
             }
 
-            return anyFileFailed ? SCC_E_UNKNOWNERROR : SCC_OK;
+            // EA calls SccCheckin once per individual file even for a multi-file "checkin branch"
+            // operation (confirmed via diagnostics - SccBeginBatch/SccEndBatch are never called),
+            // so to get a single combined commit+push for the whole branch we stage this call's
+            // files immediately, but debounce the actual commit+push: schedule it to run shortly
+            // after this call, and if another SccCheckin arrives before that timer fires, its files
+            // are added to the same pending set and the timer is reset. Only once no further
+            // SccCheckin arrives within the debounce window do we actually commit+push everything
+            // accumulated so far.
+            //
+            // EA only has a single comment field per checkin operation, so a different comment
+            // arriving means this call belongs to a different checkin (either an individual file
+            // checked in on its own, or a separate batch) rather than a continuation of the
+            // currently pending one. In that case, flush the pending batch immediately - under its
+            // original comment - before starting a fresh batch under the new comment.
+            Dictionary<string, List<string>>? filesToFlushNow = null;
+            string? commentToFlushNow = null;
+
+            lock (s_pendingCheckinLock)
+            {
+                if (s_pendingComment != null && !string.Equals(s_pendingComment, comment, StringComparison.Ordinal))
+                {
+                    filesToFlushNow = new Dictionary<string, List<string>>(s_pendingFilesByRepo, StringComparer.OrdinalIgnoreCase);
+                    commentToFlushNow = s_pendingComment;
+
+                    s_pendingFilesByRepo.Clear();
+                    s_pendingComment = null;
+                    s_pendingCheckinTimer?.Dispose();
+                    s_pendingCheckinTimer = null;
+                }
+
+                s_pendingComment ??= comment;
+
+                foreach (var (repoPath, filePaths) in filesByRepo)
+                {
+                    if (!s_pendingFilesByRepo.TryGetValue(repoPath, out List<string>? existing))
+                    {
+                        existing = new List<string>();
+                        s_pendingFilesByRepo[repoPath] = existing;
+                    }
+                    existing.AddRange(filePaths);
+                }
+
+                s_pendingCheckinTimer?.Dispose();
+                s_pendingCheckinTimer = new System.Threading.Timer(
+                    FlushPendingCheckins,
+                    null,
+                    PendingCheckinDebounce,
+                    System.Threading.Timeout.InfiniteTimeSpan);
+            }
+
+            if (filesToFlushNow != null && commentToFlushNow != null)
+            {
+                CommitAndPushFiles(filesToFlushNow, commentToFlushNow);
+            }
+
+            return SCC_OK;
         }
         catch (Exception ex)
         {
@@ -245,39 +361,94 @@ public static class MsscciExports
     }
 
     /// <summary>
-    /// Stages the given file, commits (if there are actually staged changes), and pushes to the
-    /// "origin" remote if one is configured. Shared by SccCheckin and SccAdd: MSSCCI assumes a
-    /// centralized VCS model (e.g. Visual SourceSafe) where adding a file to source control also
-    /// implicitly checks it in, so SccAdd must perform the same commit+push as SccCheckin rather
-    /// than just staging locally.
+    /// Timer callback: commits and pushes everything accumulated in s_pendingFilesByRepo as a
+    /// single commit per repo, then clears the pending state. Runs on a thread pool thread once
+    /// the debounce window in SccCheckin has elapsed with no further SccCheckin calls.
     /// </summary>
-    private static void StageCommitAndPush(Repository repo, string filePath, string comment)
+    private static void FlushPendingCheckins(object? state)
+    {
+        Dictionary<string, List<string>> filesByRepo;
+        string comment;
+
+        lock (s_pendingCheckinLock)
+        {
+            if (s_pendingFilesByRepo.Count == 0) return;
+
+            filesByRepo = new Dictionary<string, List<string>>(s_pendingFilesByRepo, StringComparer.OrdinalIgnoreCase);
+            comment = string.IsNullOrWhiteSpace(s_pendingComment) ? "EA Checkin" : s_pendingComment;
+
+            s_pendingFilesByRepo.Clear();
+            s_pendingComment = null;
+            s_pendingCheckinTimer?.Dispose();
+            s_pendingCheckinTimer = null;
+        }
+
+        CommitAndPushFiles(filesByRepo, comment);
+    }
+
+    /// <summary>
+    /// Commits and pushes the given per-repo file sets under the given comment. Used both by the
+    /// debounce-timer flush and by SccCheckin itself when it detects a comment change and needs to
+    /// flush the previous batch immediately before starting a new one.
+    /// </summary>
+    private static void CommitAndPushFiles(Dictionary<string, List<string>> filesByRepo, string comment)
+    {
+        if (string.IsNullOrWhiteSpace(comment)) comment = "EA Checkin";
+
+        foreach (var (repoPath, filePaths) in filesByRepo)
+        {
+            try
+            {
+                using var repo = OpenRepositoryEnsuringSafeDirectory(repoPath);
+                StageCommitAndPush(repo, filePaths, comment);
+            }
+            catch (Exception ex)
+            {
+                LogDiagnostic("CommitAndPushFiles", ex);
+            }
+        }
+    }
+
+
+    /// <summary>
+    /// Stages the given files, commits them all together as a single commit (if any of them have
+    /// actual staged changes), and pushes to the "origin" remote if one is configured.
+    /// </summary>
+    private static void StageCommitAndPush(Repository repo, IReadOnlyList<string> filePaths, string comment)
     {
         // 0. Reset the index to match HEAD first. Without this, any stray entries left staged by a
         // previous operation that failed after staging but before committing (e.g. the earlier
         // "author is null" or "remote authentication required" failures) would get swept into this
-        // commit alongside the intended file, resulting in commits that include unrelated files.
+        // commit alongside the intended files, resulting in commits that include unrelated files.
         if (repo.Head.Tip != null)
         {
             repo.Reset(ResetMode.Mixed, repo.Head.Tip);
         }
 
-        // 1. Stage only the target file
-        Commands.Stage(repo, filePath);
+        // 1. Stage only the target files
+        bool hasStagedChange = false;
+        foreach (string filePath in filePaths)
+        {
+            Commands.Stage(repo, filePath);
 
-        // 2. Commit (skip if this specific file has no actual staged changes, e.g. file unchanged).
-        // Checking the whole-repo IsDirty flag here is wrong: this repo's working directory can
-        // easily have unrelated dirty files (e.g. other in-progress edits, other untracked test
-        // files) that make IsDirty always true regardless of whether THIS file changed, which was
-        // causing "git commit" to fail with "no changes added to commit" whenever EA checked in a
-        // file that itself had nothing new to commit.
-        string relativePath = GetRelativePath(repo, filePath);
-        FileStatus fileStatus = repo.RetrieveStatus(relativePath);
-        bool hasStagedChange = fileStatus.HasFlag(FileStatus.NewInIndex) ||
-                                fileStatus.HasFlag(FileStatus.ModifiedInIndex) ||
-                                fileStatus.HasFlag(FileStatus.DeletedFromIndex) ||
-                                fileStatus.HasFlag(FileStatus.RenamedInIndex) ||
-                                fileStatus.HasFlag(FileStatus.TypeChangeInIndex);
+            // Checking the whole-repo IsDirty flag here would be wrong: this repo's working
+            // directory can easily have unrelated dirty files (e.g. other in-progress edits, other
+            // untracked test files) that make IsDirty always true regardless of whether any of
+            // these specific files changed, which was causing "git commit" to fail with "no changes
+            // added to commit" whenever EA checked in files that themselves had nothing new to commit.
+            string relativePath = GetRelativePath(repo, filePath);
+            FileStatus fileStatus = repo.RetrieveStatus(relativePath);
+            if (fileStatus.HasFlag(FileStatus.NewInIndex) ||
+                fileStatus.HasFlag(FileStatus.ModifiedInIndex) ||
+                fileStatus.HasFlag(FileStatus.DeletedFromIndex) ||
+                fileStatus.HasFlag(FileStatus.RenamedInIndex) ||
+                fileStatus.HasFlag(FileStatus.TypeChangeInIndex))
+            {
+                hasStagedChange = true;
+            }
+        }
+
+        // 2. Commit (skip if none of the files actually had staged changes, e.g. all unchanged)
         if (!hasStagedChange)
         {
             return;
@@ -304,6 +475,15 @@ public static class MsscciExports
         {
             PushViaGitCli(repo.Info.WorkingDirectory);
         }
+    }
+
+    /// <summary>
+    /// Single-file convenience overload of StageCommitAndPush, used by SccAdd where each call
+    /// naturally targets a single file and its own commit (add == an implicit individual checkin).
+    /// </summary>
+    private static void StageCommitAndPush(Repository repo, string filePath, string comment)
+    {
+        StageCommitAndPush(repo, new[] { filePath }, comment);
     }
 
     /// <summary>
@@ -532,6 +712,9 @@ public static class MsscciExports
     /// </summary>
     private static unsafe int AddCore(int nFiles, sbyte** lpFileNames, IntPtr pContext, string comment)
     {
+        // A new SccAdd arriving means EA has moved on from any pending checkin batch; flush now.
+        FlushPendingCheckinsNowIfActive();
+
         try
         {
             for (int i = 0; i < nFiles; i++)
@@ -587,6 +770,8 @@ public static class MsscciExports
         sbyte* lpFileName,
         sbyte* lpNewName)
     {
+        FlushPendingCheckinsNowIfActive();
+
         try
         {
             string oldPath = ResolveEaPath(ReadPlainAnsiString((IntPtr)lpFileName), pContext);
@@ -669,6 +854,8 @@ public static class MsscciExports
 
     private static unsafe int GetCore(int nFiles, sbyte** lpFileNames, IntPtr pContext)
     {
+        FlushPendingCheckinsNowIfActive();
+
         try
         {
             for (int i = 0; i < nFiles; i++)
@@ -702,6 +889,11 @@ public static class MsscciExports
         sbyte** lpFileNames,
         int* pStatus)
     {
+        // EA calls SccQueryInfo right after every SccCheckin to refresh each file's status icon,
+        // so its arrival is a reliable sign the current checkin/batch operation is still ongoing;
+        // extend the pending-checkin debounce window if one is active.
+        ExtendPendingCheckinTimerIfActive();
+
         try
         {
             for (int i = 0; i < nFiles; i++)
@@ -710,7 +902,7 @@ public static class MsscciExports
                 string filePath = ResolveEaPath(ReadFileNamePointer(rawPtr), pContext);
 
                 string? repoPath = DiscoverRepositoryPath(filePath);
-                LogDiagnostic("SccQueryInfo", new Exception($"rawPtr=0x{rawPtr:X} filePath='{filePath}' repoPath='{repoPath}'"));
+
                 if (repoPath == null)
                 {
                     if (pStatus != null) pStatus[i] = SCC_STATUS_NOTCONTROLLED;
@@ -930,6 +1122,10 @@ public static class MsscciExports
     /// </summary>
     private static unsafe int ForEachFileRepo(int nFiles, sbyte** lpFileNames, IntPtr pContext, Action<Repository, string> action)
     {
+        // Called by SccRemove/SccCheckout/SccUncheckout; any of these arriving means EA has moved
+        // on from any pending checkin batch, so flush it immediately.
+        FlushPendingCheckinsNowIfActive();
+
         try
         {
             for (int i = 0; i < nFiles; i++)
@@ -1117,6 +1313,8 @@ public static class MsscciExports
         sbyte** lpFileNames,
         int fOptions)
     {
+        FlushPendingCheckinsNowIfActive();
+
         try
         {
             var sb = new System.Text.StringBuilder();
@@ -1310,6 +1508,10 @@ public static class MsscciExports
         int nFiles,
         sbyte** lpFileNames)
     {
+        // Diagnostics confirmed EA never actually invokes this during a "checkin branch"; batching
+        // is instead handled via the debounce mechanism in SccCheckin/FlushPendingCheckins. Logging
+        // is kept here in case a future EA version (or a different caller) does use it.
+        LogDiagnostic("SccBeginBatch", new Exception($"nCommand={nCommand} nFiles={nFiles}"));
         return SCC_OK;
     }
 
@@ -1319,6 +1521,7 @@ public static class MsscciExports
         IntPtr hWnd,
         int nCommand)
     {
+        LogDiagnostic("SccEndBatch", new Exception($"nCommand={nCommand}"));
         return SCC_OK;
     }
 
