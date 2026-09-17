@@ -94,51 +94,54 @@ implemented manually by walking up the directory tree from a candidate path and 
 This turned out to be one of the trickiest parts of the whole project, and it's split into two
 distinct problems depending on what kind of string is being read.
 
-### File name pointers
+### File name and comment pointers (and why a scanning heuristic was removed)
 
-Diagnostics showed that the `lpFileNames` pointers EA passes are **not** plain
-null-terminated ANSI C strings at the given address. There's a variable-length, non-obvious header
-or wrapper (consistent with how MFC/ATL-style string buffers are commonly laid out) preceding the
-actual path text, and the offset of the real string varies. Naive approaches — fixed offsets,
-"first printable run wins" — produced truncated or garbage paths.
+An earlier version of this provider assumed `lpFileNames` pointers were **not** plain
+null-terminated ANSI C strings at the given address — the theory being that EA wrapped paths in a
+variable-length, MFC/ATL-style buffer header preceding the actual path text. A `ReadMfcCStringOrAnsi`
+helper was built to scan a bounded memory window after the raw pointer, decode every candidate
+ANSI string found, and score candidates by how "path-like" they looked and whether they resolved
+to a real file/directory on disk.
 
-The working approach (`ReadMfcCStringOrAnsi`) scans a bounded window of memory (260 bytes,
-MAX_PATH-ish) after the raw pointer, decodes a candidate ANSI string at every position that looks
-like the start of a new printable run, and scores each candidate:
+The same reasoning was initially (wrongly) applied to `lpComment` too, which turned out to be a
+plain, directly-addressable string all along — the scanning heuristic could pick up an unrelated
+path-like string sitting later in memory instead of the actual (often short) comment text, which
+caused commit messages to sometimes contain garbage path fragments or nothing at all. This was
+fixed by decoding comments with a simple, direct `Marshal.PtrToStringAnsi` read instead
+(`ReadPlainAnsiString`).
 
-1. Prefer the longest candidate that starts with a drive letter (`C:\`) or UNC prefix (`\\`) *and*
-   actually resolves to a real file or existing parent directory on disk.
-2. Otherwise, prefer the longest "path-like" candidate (contains both a path separator and a dot),
-   since EA's layout sometimes truncates the leading portion of the real path while leaving the
-   trailing filename fragment intact and reliable.
-3. Otherwise, fall back to the single longest printable candidate found.
-4. As a last resort, treat the raw pointer itself as a plain null-terminated ANSI string.
+That fix raised an obvious question: was the file-name scanning heuristic solving a real problem
+either? To find out, temporary diagnostic logging was added that recorded, for every file-name
+pointer, both a plain direct read and the heuristic's chosen result side by side. Testing showed:
 
-Because the leading portion of a decoded path can still be corrupted/truncated even when a
-candidate is found, `ResolveEaPath` additionally re-derives the trailing filename segment and
-re-combines it with a cached project root path (captured earlier from `SccOpenProject`, keyed by
-EA's `pContext` handle, with a "last opened project" fallback since `pContext` isn't always a
-stable/non-zero key across calls).
+- In the overwhelming majority of calls, the plain read and the heuristic's result were
+  **identical** — the scanning logic wasn't correcting anything.
+- In the one case where they differed, the heuristic's result was a coincidentally-recovered
+  fragment for a call unrelated to an actual observed bug.
+- In the call that *did* cause a real failure (an `SccAdd` producing a garbage path, causing
+  "nothing to commit"), the plain read and the heuristic's result **agreed with each other and
+  were both wrong** — meaning the heuristic provided zero actual protection in the one case it
+  mattered.
 
-### Comment pointers
+This showed the scanning heuristic was unnecessary complexity that didn't reliably solve the
+problem it was built for. It was removed; `ReadPlainAnsiString` (the same simple decoder used for
+comments) is now used for both file names and comments everywhere.
 
-Initially, comment strings (`lpComment`) were decoded with the same `ReadMfcCStringOrAnsi`
-heuristic used for file paths. This was wrong: diagnostics showed EA actually passes comment text
-as a **plain, direct** null-terminated ANSI string at the given pointer — no wrapper, no scanning
-needed. Reusing the path-oriented heuristic on a comment could pick up an unrelated path-like
-string sitting later in the same memory window instead of the real (often short) comment text,
-which is what caused commit messages to sometimes contain garbage path fragments, or nothing at
-all.
-
-The fix was a separate, much simpler decoder for comments (`ReadPlainAnsiString`) that does a
-straight `Marshal.PtrToStringAnsi` with no scanning or heuristics, used consistently everywhere
-`lpComment` is decoded (`SccCheckin`, `SccAdd`, `SccAddFromScc`, `SccAddFilesFromSCC`).
+Because EA's path fragments have still been observed to sometimes be incomplete/truncated or, in
+rarer cases, outright invalid for a given call, `ResolveEaPath` still re-derives the trailing
+filename segment from whatever was decoded and re-combines it with a cached project root path
+(captured earlier from `SccOpenProject`, keyed by EA's `pContext` handle, with a "last opened
+project" fallback since `pContext` isn't always a stable/non-zero key across calls). Diagnostic
+logging was added directly in `SccAdd` (raw pointer value and plain-read result per file index) to
+help continue diagnosing any remaining cases where EA supplies a stale or invalid pointer for a
+particular call — a problem no string-parsing heuristic can fix, since the underlying pointer
+itself doesn't reference the real path in those cases.
 
 ## 6. SccQueryInfo status flags
 
 EA calls `SccQueryInfo` after operations like Add to confirm the resulting file status, and is
 picky about the returned bit flags (`SCC_STATUS_CONTROLLED`, `SCC_STATUS_CHECKEDOUT`,
-`SCC_STATUS_DIFFERENT`, etc., mapped from LibGit2Sharp's `FileStatus`). Returning an unexpected
+
 combination (e.g. reporting a freshly-added, unmodified file as "different") caused EA to report
 "Unexpected status after adding file." The mapping was tuned so a clean, tracked file only reports
 `SCC_STATUS_CONTROLLED`.

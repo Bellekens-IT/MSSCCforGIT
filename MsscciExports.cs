@@ -207,20 +207,35 @@ public static class MsscciExports
 
             LogDiagnostic("SccCheckin.Entry", new Exception($"nFiles={nFiles} comment='{comment}' fOptions={fOptions}"));
 
+            bool anyFileFailed = false;
+
             for (int i = 0; i < nFiles; i++)
             {
-                string filePath = ResolveEaPath(ReadMfcCStringOrAnsi((IntPtr)lpFileNames[i]), pContext);
+                string filePath = ResolveEaPath(ReadPlainAnsiString((IntPtr)lpFileNames[i]), pContext);
 
-                // Find local git repo root from the package path
-                string? repoPath = DiscoverRepositoryPath(filePath);
-                LogDiagnostic("SccCheckin", new Exception($"filePath='{filePath}' repoPath='{repoPath}'"));
-                if (repoPath == null) continue;
+                try
+                {
+                    // Find local git repo root from the package path
+                    string? repoPath = DiscoverRepositoryPath(filePath);
+                    LogDiagnostic("SccCheckin", new Exception($"filePath='{filePath}' repoPath='{repoPath}'"));
+                    if (repoPath == null) continue;
 
-                using var repo = OpenRepositoryEnsuringSafeDirectory(repoPath);
-                StageCommitAndPush(repo, filePath, comment);
+                    using var repo = OpenRepositoryEnsuringSafeDirectory(repoPath);
+                    StageCommitAndPush(repo, filePath, comment);
+                }
+                catch (Exception ex)
+                {
+                    // A failure on one file (e.g. a transient git/network error) must not abort the
+                    // rest of the batch - EA calls SccCheckin once per selected package/file, and
+                    // previously a single failure here caused the whole loop (and every remaining
+                    // file in the batch) to be skipped, with EA reporting SCC_E_INITIALIZEFAILED and
+                    // leaving all of them stuck as "checked out" even though most had no real issue.
+                    LogDiagnostic("SccCheckin", ex);
+                    anyFileFailed = true;
+                }
             }
 
-            return SCC_OK;
+            return anyFileFailed ? SCC_E_UNKNOWNERROR : SCC_OK;
         }
         catch (Exception ex)
         {
@@ -250,8 +265,20 @@ public static class MsscciExports
         // 1. Stage only the target file
         Commands.Stage(repo, filePath);
 
-        // 2. Commit (skip if nothing is actually staged, e.g. file unchanged)
-        if (!repo.RetrieveStatus().IsDirty)
+        // 2. Commit (skip if this specific file has no actual staged changes, e.g. file unchanged).
+        // Checking the whole-repo IsDirty flag here is wrong: this repo's working directory can
+        // easily have unrelated dirty files (e.g. other in-progress edits, other untracked test
+        // files) that make IsDirty always true regardless of whether THIS file changed, which was
+        // causing "git commit" to fail with "no changes added to commit" whenever EA checked in a
+        // file that itself had nothing new to commit.
+        string relativePath = GetRelativePath(repo, filePath);
+        FileStatus fileStatus = repo.RetrieveStatus(relativePath);
+        bool hasStagedChange = fileStatus.HasFlag(FileStatus.NewInIndex) ||
+                                fileStatus.HasFlag(FileStatus.ModifiedInIndex) ||
+                                fileStatus.HasFlag(FileStatus.DeletedFromIndex) ||
+                                fileStatus.HasFlag(FileStatus.RenamedInIndex) ||
+                                fileStatus.HasFlag(FileStatus.TypeChangeInIndex);
+        if (!hasStagedChange)
         {
             return;
         }
@@ -475,6 +502,21 @@ public static class MsscciExports
         string comment = lpComment != null ? ReadPlainAnsiString((IntPtr)lpComment) : "EA Add";
         if (string.IsNullOrWhiteSpace(comment)) comment = "EA Add";
 
+        try
+        {
+            for (int i = 0; i < nFiles; i++)
+            {
+                IntPtr rawPtr = (IntPtr)lpFileNames[i];
+                string plainRead = rawPtr != IntPtr.Zero ? (Marshal.PtrToStringAnsi(rawPtr) ?? "") : "(null)";
+                string scannedRead = ReadFileNamePointer(rawPtr);
+                LogDiagnostic("SccAdd.Entry", new Exception($"nFiles={nFiles} index={i} rawPtr=0x{rawPtr:X} plainRead='{plainRead}' scannedRead='{scannedRead}' comment='{comment}'"));
+            }
+        }
+        catch (Exception ex)
+        {
+            LogDiagnostic("SccAdd.Entry", ex);
+        }
+
         return AddCore(nFiles, lpFileNames, pContext, comment);
     }
 
@@ -483,13 +525,38 @@ public static class MsscciExports
     /// staging concept: adding a file to source control also implicitly checks it in. Translated to
     /// Git, SccAdd must therefore stage, commit, AND push - not just stage - otherwise the file
     /// never reaches the remote even though EA reports it as successfully added.
+    /// Note: pFlags is an EA-supplied INPUT array of per-file type flags (e.g. text/binary), not an
+    /// output status array - it must not be written to. An earlier attempt to write success/error
+    /// codes into it was based on a wrong assumption and corrupted adjacent EA-owned memory used
+    /// for the file name buffers on subsequent calls, so it has been removed.
     /// </summary>
     private static unsafe int AddCore(int nFiles, sbyte** lpFileNames, IntPtr pContext, string comment)
     {
-        return ForEachFileRepo(nFiles, lpFileNames, pContext, (repo, filePath) =>
+        try
         {
-            StageCommitAndPush(repo, filePath, comment);
-        });
+            for (int i = 0; i < nFiles; i++)
+            {
+                IntPtr rawPtr = (IntPtr)lpFileNames[i];
+                string filePath = ResolveEaPath(ReadFileNamePointer(rawPtr), pContext);
+
+                string? repoPath = DiscoverRepositoryPath(filePath);
+                LogDiagnostic("AddCore", new Exception($"filePath='{filePath}' repoPath='{repoPath}'"));
+                if (repoPath == null)
+                {
+                    continue;
+                }
+
+                using var repo = OpenRepositoryEnsuringSafeDirectory(repoPath);
+                StageCommitAndPush(repo, filePath, comment);
+            }
+
+            return SCC_OK;
+        }
+        catch (Exception ex)
+        {
+            LogDiagnostic("AddCore", ex);
+            return SCC_E_UNKNOWNERROR;
+        }
     }
 
     /// <summary>
@@ -522,8 +589,8 @@ public static class MsscciExports
     {
         try
         {
-            string oldPath = ResolveEaPath(ReadMfcCStringOrAnsi((IntPtr)lpFileName), pContext);
-            string newPath = ResolveEaPath(ReadMfcCStringOrAnsi((IntPtr)lpNewName), pContext);
+            string oldPath = ResolveEaPath(ReadPlainAnsiString((IntPtr)lpFileName), pContext);
+            string newPath = ResolveEaPath(ReadPlainAnsiString((IntPtr)lpNewName), pContext);
 
             string? repoPath = DiscoverRepositoryPath(oldPath);
             if (repoPath == null) return SCC_E_FILENOTCONTROLLED;
@@ -606,7 +673,7 @@ public static class MsscciExports
         {
             for (int i = 0; i < nFiles; i++)
             {
-                string filePath = ResolveEaPath(ReadMfcCStringOrAnsi((IntPtr)lpFileNames[i]), pContext);
+                string filePath = ResolveEaPath(ReadPlainAnsiString((IntPtr)lpFileNames[i]), pContext);
 
                 string? repoPath = DiscoverRepositoryPath(filePath);
                 if (repoPath == null) continue;
@@ -639,9 +706,11 @@ public static class MsscciExports
         {
             for (int i = 0; i < nFiles; i++)
             {
-                string filePath = ResolveEaPath(ReadMfcCStringOrAnsi((IntPtr)lpFileNames[i]), pContext);
+                IntPtr rawPtr = (IntPtr)lpFileNames[i];
+                string filePath = ResolveEaPath(ReadFileNamePointer(rawPtr), pContext);
 
                 string? repoPath = DiscoverRepositoryPath(filePath);
+                LogDiagnostic("SccQueryInfo", new Exception($"rawPtr=0x{rawPtr:X} filePath='{filePath}' repoPath='{repoPath}'"));
                 if (repoPath == null)
                 {
                     if (pStatus != null) pStatus[i] = SCC_STATUS_NOTCONTROLLED;
@@ -674,6 +743,7 @@ public static class MsscciExports
                 }
 
                 if (pStatus != null) pStatus[i] = flags;
+                LogDiagnostic("SccQueryInfo", new Exception($"relativePath='{relativePath}' fileStatus={fileStatus} flags={flags}"));
             }
 
             return SCC_OK;
@@ -738,11 +808,10 @@ public static class MsscciExports
     }
 
     /// <summary>
-    /// Reads a plain, straightforward null-terminated ANSI string (e.g. a comment). Unlike file
-    /// name pointers, EA passes comment pointers directly (confirmed via diagnostics showing
-    /// correctly-decoded comments at offset 0), so the path-scanning heuristic in
-    /// ReadMfcCStringOrAnsi must NOT be used here: it can pick up an unrelated path-like string
-    /// from adjacent memory instead of the actual (possibly short/blank) comment text.
+    /// Reads a plain, null-terminated ANSI string at the given pointer. Used for comment pointers
+    /// (lpComment), which diagnostics confirmed EA always passes directly at the given address with
+    /// no wrapping/offset needed - unlike file name pointers (see ReadFileNamePointer below), which
+    /// do require a scanning fallback.
     /// </summary>
     private static unsafe string ReadPlainAnsiString(IntPtr rawPtr)
     {
@@ -751,18 +820,22 @@ public static class MsscciExports
     }
 
     /// <summary>
-    /// EA (Sparx Enterprise Architect) passes file name pointers as raw allocator/string blocks
-    /// rather than plain null-terminated LPCSTR pointers directly at the given address. Diagnostic
-    /// dumps showed a variable-length, non-obvious header preceding the actual ANSI path text, and
-    /// naive heuristics (fixed offsets, "first match wins") produced truncated/incorrect paths.
+    /// Reads a file name pointer as passed by EA. EA's lpFileNames buffers are frequently
+    /// truncated/corrupted at the exact address given (e.g. only 'C:\Users' or similar garbage),
+    /// but diagnostic testing showed a complete or more complete copy of the real path often exists
+    /// a little further along in the same allocation/memory window. A plain direct read at the
+    /// given pointer alone therefore isn't reliable, unlike for comment pointers - it only "happens"
+    /// to work when the string at offset 0 isn't corrupted for that particular call, which isn't
+    /// consistent across calls.
     /// Instead, we scan a bounded window of memory after rawPtr for every position that looks like
     /// the start of an absolute path (a drive letter like "C:\" or a UNC prefix "\\"), decode a
     /// null-terminated ANSI string at each candidate position, and pick the candidate that actually
     /// resolves to a real file or directory on disk. If no candidate resolves, we fall back to the
-    /// longest fully-printable candidate, then finally to treating rawPtr itself as a plain
-    /// null-terminated ANSI string.
+    /// longest "path-like" fragment found (contains a separator and a dot), then the longest fully
+    /// printable candidate, then finally to treating rawPtr itself as a plain null-terminated ANSI
+    /// string.
     /// </summary>
-    private static unsafe string ReadMfcCStringOrAnsi(IntPtr rawPtr)
+    private static unsafe string ReadFileNamePointer(IntPtr rawPtr)
     {
         if (rawPtr == IntPtr.Zero) return "";
 
@@ -862,7 +935,7 @@ public static class MsscciExports
             for (int i = 0; i < nFiles; i++)
             {
                 IntPtr rawPtr = (IntPtr)lpFileNames[i];
-                string filePath = ResolveEaPath(ReadMfcCStringOrAnsi(rawPtr), pContext);
+                string filePath = ResolveEaPath(ReadPlainAnsiString(rawPtr), pContext);
 
                 string? repoPath = DiscoverRepositoryPath(filePath);
                 LogDiagnostic("ForEachFileRepo", new Exception($"filePath='{filePath}' repoPath='{repoPath}'"));
@@ -1050,7 +1123,7 @@ public static class MsscciExports
 
             for (int i = 0; i < nFiles; i++)
             {
-                string filePath = ResolveEaPath(ReadMfcCStringOrAnsi((IntPtr)lpFileNames[i]), pContext);
+                string filePath = ResolveEaPath(ReadPlainAnsiString((IntPtr)lpFileNames[i]), pContext);
 
                 string? repoPath = DiscoverRepositoryPath(filePath);
                 LogDiagnostic("SccHistory", new Exception($"filePath='{filePath}' repoPath='{repoPath}'"));
