@@ -14,4 +14,4 @@ Windows Registry Editor Version 5.00
 
 [HKEY_LOCAL_MACHINE\SOFTWARE\WOW6432Node\Bellekens\Bellekens GIT MSSCCI]
 "SCCServerName"="Bellekens GIT MSSCCI"
-"SCCServerPath"="C:\\Users\\geert\\Documents\\GitHub\\MSSCCforGIT\\bin\\Release\\net10.0\\win-x86\\publish\\MSSCCforGIT.dll"
+"SCCServerPath"="C:\\Users\\geert\\Documents\\GitHub\\MSSCCforGIT\\bin\\Release\\net10.0-windows\\win-x86\\publish\\MSSCCforGIT.dll"

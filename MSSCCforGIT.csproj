@@ -1,12 +1,22 @@
 ﻿<Project Sdk="Microsoft.NET.Sdk">
 	<PropertyGroup>
-		<TargetFramework>net10.0</TargetFramework>
+		<TargetFramework>net10.0-windows</TargetFramework>
 		<ImplicitUsings>enable</ImplicitUsings>
 		<Nullable>enable</Nullable>
 		<AllowUnsafeBlocks>true</AllowUnsafeBlocks>
 		<!-- Compiles directly to native machine code without requiring a .NET runtime installation -->
 		<PublishAot>true</PublishAot>
 		<RuntimeIdentifier>win-x86</RuntimeIdentifier>
+		<!-- Enables WinForms dialogs (SccHistory/SccProperties) for a nicer UI than MessageBoxW. -->
+		<UseWindowsForms>true</UseWindowsForms>
+		<!--
+		  WinForms itself (System.Windows.Forms/.Primitives, System.Private.Windows.Core,
+		  System.Formats.Nrbf) isn't fully AOT-clean and emits IL3053 (AOT analysis warnings in
+		  those framework assemblies) and IL3000 (Assembly.Location under single-file/AOT) purely
+		  from framework code we don't control - not from our own SccHistory/SccProperties dialog
+		  code, which only uses basic controls (Form/Label/ListView/Button/TableLayoutPanel).
+		-->
+		<NoWarn>$(NoWarn);IL3053;IL3000</NoWarn>
 	</PropertyGroup>
 	<ItemGroup>
 	  <PackageReference Include="LibGit2Sharp" Version="0.32.0" />

@@ -49,7 +49,7 @@ remote.
 
 1. Build/publish the project in Release mode (see below), or download a published release.
    This produces `MSSCCforGIT.dll` under
-   `bin\Release\net10.0\win-x86\publish\`.
+   `bin\Release\net10.0-windows\win-x86\publish\`.
 2. Register the provider with Windows so EA can discover it. A ready-made
    [`RegisterMSSCCforGIT.reg`](RegisterMSSCCforGIT.reg) file is included — edit the
    `SCCServerPath` value inside it to point at the full path of your published

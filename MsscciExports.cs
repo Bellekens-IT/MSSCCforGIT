@@ -1388,7 +1388,7 @@ public static class MsscciExports
     /// <summary>
     /// Shows revision history for one or more files. There's no dedicated MSSCCI history UI
     /// callback for us to populate, so we shell out to "git log" for each file's relative path and
-    /// display the resulting log text in a simple message box owned by EA's window.
+    /// display the resulting entries in a WinForms ListView dialog owned by EA's window.
     /// </summary>
     [UnmanagedCallersOnly(EntryPoint = "SccHistory", CallConvs = new[] { typeof(CallConvStdcall) })]
     public static unsafe int SccHistory(
@@ -1402,8 +1402,6 @@ public static class MsscciExports
 
         try
         {
-            var sb = new System.Text.StringBuilder();
-
             for (int i = 0; i < nFiles; i++)
             {
                 string filePath = ResolveEaPath(ReadPlainAnsiString((IntPtr)lpFileNames[i]), pContext);
@@ -1415,13 +1413,9 @@ public static class MsscciExports
                 using var repo = OpenRepositoryEnsuringSafeDirectory(repoPath);
                 string relativePath = GetRelativePath(repo, filePath);
 
-                if (sb.Length > 0) sb.AppendLine().AppendLine();
-                sb.AppendLine($"History for {relativePath}:");
-                sb.Append(GetFileHistoryViaGitCli(repo.Info.WorkingDirectory, relativePath));
+                List<HistoryEntry> entries = GetFileHistoryViaGitCli(repo.Info.WorkingDirectory, relativePath);
+                MsscciDialogs.ShowHistory(hWnd, relativePath, entries);
             }
-
-            string historyText = sb.Length > 0 ? sb.ToString() : "No history available.";
-            MessageBoxW(hWnd, historyText, "File History", 0);
 
             return SCC_OK;
         }
@@ -1432,17 +1426,26 @@ public static class MsscciExports
         }
     }
 
+    // Field separator unlikely to appear in commit metadata, used to split "git log" output into
+    // discrete columns for the History/Properties dialogs.
+    private const string GitLogFieldSeparator = "\u001f";
+
     /// <summary>
-    /// Runs "git log" for a single file (relative to the repo working directory) and returns its
-    /// stdout text, using the same git-CLI approach as commit/push to sidestep LibGit2Sharp
-    /// interop issues under NativeAOT.
+    /// Runs "git log" for a single file (relative to the repo working directory) and parses its
+    /// stdout into structured entries, using the same git-CLI approach as commit/push to sidestep
+    /// LibGit2Sharp interop issues under NativeAOT.
     /// </summary>
-    private static string GetFileHistoryViaGitCli(string workingDirectory, string relativePath)
+    private static List<HistoryEntry> GetFileHistoryViaGitCli(string workingDirectory, string relativePath)
     {
         var psi = new System.Diagnostics.ProcessStartInfo
         {
             FileName = "git",
-            ArgumentList = { "log", "--follow", "--date=short", "--pretty=format:%h %ad %an: %s", "--", relativePath },
+            ArgumentList =
+            {
+                "log", "--follow", "--date=short",
+                $"--pretty=format:%h{GitLogFieldSeparator}%ad{GitLogFieldSeparator}%an{GitLogFieldSeparator}%s",
+                "--", relativePath,
+            },
             WorkingDirectory = workingDirectory,
             UseShellExecute = false,
             CreateNoWindow = true,
@@ -1453,7 +1456,8 @@ public static class MsscciExports
         using var process = System.Diagnostics.Process.Start(psi);
         if (process == null)
         {
-            return "(failed to start 'git log')";
+            LogDiagnostic("GetFileHistoryViaGitCli", new Exception("failed to start 'git log'"));
+            return new List<HistoryEntry>();
         }
 
         string stdout = process.StandardOutput.ReadToEnd();
@@ -1462,24 +1466,70 @@ public static class MsscciExports
 
         LogDiagnostic("GetFileHistoryViaGitCli", new Exception($"exitCode={process.ExitCode} stdout='{stdout}' stderr='{stderr}'"));
 
-        if (process.ExitCode != 0)
+        var entries = new List<HistoryEntry>();
+        if (process.ExitCode != 0 || string.IsNullOrWhiteSpace(stdout))
         {
-            return $"(error: {stderr})";
+            return entries;
         }
 
-        return string.IsNullOrWhiteSpace(stdout) ? "(no history)" : stdout;
+        foreach (string line in stdout.Split('\n', StringSplitOptions.RemoveEmptyEntries))
+        {
+            string[] parts = line.Split(GitLogFieldSeparator, 4);
+            if (parts.Length == 4)
+            {
+                entries.Add(new HistoryEntry(parts[0], parts[1], parts[2], parts[3]));
+            }
+        }
+
+        return entries;
     }
 
     /// <summary>
-    /// Shows provider-specific file properties. Not yet implemented.
+    /// Shows provider-specific file properties: the file's Git-relative path, current status, and
+    /// last commit details (hash/author/date/message), via the same git-CLI approach used for
+    /// commit/push/history to sidestep LibGit2Sharp interop issues under NativeAOT.
     /// </summary>
+    /// <remarks>
+    /// Although the MSSCCI header declares SccProperties as returning void, EA's dispatch layer
+    /// evidently reads back a return code from this call like it does for the other Scc* entry
+    /// points, and reports whatever garbage was left in the return register as an "Unknown SCC
+    /// Error" (e.g. 767471944) since we were never explicitly setting one. Returning an explicit
+    /// SCC_OK avoids that spurious error dialog.
+    /// </remarks>
     [UnmanagedCallersOnly(EntryPoint = "SccProperties", CallConvs = new[] { typeof(CallConvStdcall) })]
-    public static unsafe void SccProperties(
+    public static unsafe int SccProperties(
         IntPtr pContext,
         IntPtr hWnd,
         sbyte* lpFileName)
     {
-        // No provider-specific properties UI to show.
+        try
+        {
+            string filePath = ResolveEaPath(ReadPlainAnsiString((IntPtr)lpFileName), pContext);
+
+            string? repoPath = DiscoverRepositoryPath(filePath);
+            LogDiagnostic("SccProperties", new Exception($"filePath='{filePath}' repoPath='{repoPath}'"));
+            if (repoPath == null)
+            {
+                MsscciDialogs.ShowProperties(hWnd, filePath, filePath, "(not in a Git repository)", "Not controlled", null);
+                return SCC_OK;
+            }
+
+            using var repo = OpenRepositoryEnsuringSafeDirectory(repoPath);
+            string relativePath = GetRelativePath(repo, filePath);
+            FileStatus fileStatus = repo.RetrieveStatus(relativePath);
+
+            List<HistoryEntry> lastCommitEntries = GetFileHistoryViaGitCli(repo.Info.WorkingDirectory, relativePath);
+            HistoryEntry? lastCommit = lastCommitEntries.Count > 0 ? lastCommitEntries[0] : null;
+
+            MsscciDialogs.ShowProperties(hWnd, filePath, relativePath, repoPath, fileStatus.ToString(), lastCommit);
+
+            return SCC_OK;
+        }
+        catch (Exception ex)
+        {
+            LogDiagnostic("SccProperties", ex);
+            return SCC_E_UNKNOWNERROR;
+        }
     }
 
     /// <summary>
