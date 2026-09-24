@@ -103,6 +103,30 @@ public static class MsscciExports
     private static readonly System.Collections.Concurrent.ConcurrentDictionary<IntPtr, string> s_projectRootsByContext = new();
 
     /// <summary>
+    /// Tracks files added via SccAdd with EA's "Keep checked out" option ticked. Git has no
+    /// exclusive/local-only staging concept like the centralized VCS model MSSCCI assumes, so we
+    /// still commit+push the file immediately like a normal add (otherwise it would never reach the
+    /// remote and other users/EA instances wouldn't see it as added at all) - but we remember it
+    /// here so SccQueryInfo keeps reporting it as checked out afterward, matching what the user
+    /// asked for and letting them continue editing without needing to check it out again. Cleared
+    /// once the file is genuinely checked in again via SccCheckin.
+    /// </summary>
+    private static readonly System.Collections.Concurrent.ConcurrentDictionary<string, byte> s_keptCheckedOutFiles =
+        new(StringComparer.OrdinalIgnoreCase);
+
+    /// <summary>
+    /// Remembers the most recently resolved full file path from SccQueryInfo, along with when it
+    /// was resolved. EA reliably calls SccQueryInfo for a file right before SccAdd for that same
+    /// file (confirmed via diagnostics), so when SccAdd's own memory-pointer scan fails to recover
+    /// a usable full path (observed to happen intermittently - EA's buffer layout varies across
+    /// calls and the real path isn't always within the scanned window), this cached path from the
+    /// immediately preceding SccQueryInfo call is a much more reliable fallback than continuing to
+    /// guess from raw memory.
+    /// </summary>
+    private static string? s_lastQueryInfoResolvedPath;
+    private static DateTime s_lastQueryInfoResolvedAt;
+
+    /// <summary>
     /// Fallback project root used when pContext isn't a reliable/stable key (observed to vary or
     /// be zero across some EA calls). Since this provider only supports one open project at a
     /// time in practice, tracking the most recently opened root as a fallback is sufficient.
@@ -294,6 +318,9 @@ public static class MsscciExports
                     filesByRepo[repoPath] = files;
                 }
                 files.Add(filePath);
+
+                // A real SccCheckin clears any "keep checked out" flag left over from SccAdd.
+                s_keptCheckedOutFiles.TryRemove(filePath, out _);
             }
 
             // EA calls SccCheckin once per individual file even for a multi-file "checkin branch"
@@ -686,10 +713,14 @@ public static class MsscciExports
         {
             for (int i = 0; i < nFiles; i++)
             {
+                // SccAdd's own lpFileNames pointer has proven unreliable to read directly (EA's
+                // buffer layout for it varies across calls and doesn't consistently contain the
+                // real path), so we no longer rely on it for path resolution - only the path cached
+                // from the preceding, reliable SccQueryInfo call is used (see AddCore). This log
+                // line just records what SccAdd itself supplied, for diagnostic comparison.
                 IntPtr rawPtr = (IntPtr)lpFileNames[i];
-                string plainRead = rawPtr != IntPtr.Zero ? (Marshal.PtrToStringAnsi(rawPtr) ?? "") : "(null)";
-                string scannedRead = ReadFileNamePointer(rawPtr);
-                LogDiagnostic("SccAdd.Entry", new Exception($"nFiles={nFiles} index={i} rawPtr=0x{rawPtr:X} plainRead='{plainRead}' scannedRead='{scannedRead}' comment='{comment}'"));
+                int pFlagsValue = pFlags != null ? pFlags[i] : 0;
+                LogDiagnostic("SccAdd.Entry", new Exception($"nFiles={nFiles} index={i} rawPtr=0x{rawPtr:X} comment='{comment}' fOptions=0x{fOptions:X} pFlags[i]=0x{pFlagsValue:X}"));
             }
         }
         catch (Exception ex)
@@ -697,40 +728,71 @@ public static class MsscciExports
             LogDiagnostic("SccAdd.Entry", ex);
         }
 
-        return AddCore(nFiles, lpFileNames, pContext, comment);
+        return AddCore(nFiles, lpFileNames, pContext, comment, pFlags);
     }
 
     /// <summary>
     /// MSSCCI assumes a centralized VCS model (e.g. Visual SourceSafe) where there's no local-only
     /// staging concept: adding a file to source control also implicitly checks it in. Translated to
     /// Git, SccAdd must therefore stage, commit, AND push - not just stage - otherwise the file
-    /// never reaches the remote even though EA reports it as successfully added.
-    /// Note: pFlags is an EA-supplied INPUT array of per-file type flags (e.g. text/binary), not an
-    /// output status array - it must not be written to. An earlier attempt to write success/error
-    /// codes into it was based on a wrong assumption and corrupted adjacent EA-owned memory used
-    /// for the file name buffers on subsequent calls, so it has been removed.
+    /// never reaches the remote even though EA reports it as successfully added. This applies even
+    /// when EA's "Keep checked out" checkbox is ticked: Git has no real exclusive-lock/local-only
+    /// concept to honor, so the file is still committed+pushed like a normal add, but it's recorded
+    /// in s_keptCheckedOutFiles so SccQueryInfo continues reporting it as checked out afterward.
+    /// Confirmed via diagnostics that fOptions is always 0 regardless of this checkbox, but
+    /// pFlags[i] (nominally documented as per-file type flags e.g. text/binary) carries bit 0x1000
+    /// when it's ticked (0x0 otherwise) - so we key off that bit per file instead.
+    /// Note: pFlags is otherwise an EA-supplied INPUT array and must not be written to - an earlier
+    /// attempt to write success/error codes into it corrupted adjacent EA-owned memory used for the
+    /// file name buffers on subsequent calls, so writing to it has been removed; here it is only read.
     /// </summary>
-    private static unsafe int AddCore(int nFiles, sbyte** lpFileNames, IntPtr pContext, string comment)
+    private static unsafe int AddCore(int nFiles, sbyte** lpFileNames, IntPtr pContext, string comment, int* pFlags = null)
     {
         // A new SccAdd arriving means EA has moved on from any pending checkin batch; flush now.
         FlushPendingCheckinsNowIfActive();
+
+        const int SCC_FILE_KEEPCHECKEDOUT = 0x1000;
 
         try
         {
             for (int i = 0; i < nFiles; i++)
             {
-                IntPtr rawPtr = (IntPtr)lpFileNames[i];
-                string filePath = ResolveEaPath(ReadFileNamePointer(rawPtr), pContext);
+                // EA reliably calls SccQueryInfo for a file immediately before calling SccAdd for
+                // that same file (confirmed via diagnostics), and that call's path resolution has
+                // proven completely reliable. SccAdd's own file-name pointer, by contrast, has
+                // proven unreliable to scan directly (EA's buffer layout for it varies across calls
+                // and doesn't always contain the real path), so we no longer attempt that at all and
+                // rely solely on the path cached from the preceding SccQueryInfo call.
+                if (s_lastQueryInfoResolvedPath == null ||
+                    DateTime.UtcNow - s_lastQueryInfoResolvedAt >= TimeSpan.FromSeconds(5))
+                {
+                    LogDiagnostic("AddCore", new Exception($"index={i} skipped: no recent SccQueryInfo-resolved path available"));
+                    continue;
+                }
+
+                string filePath = s_lastQueryInfoResolvedPath;
+
+                bool keepCheckedOut = pFlags != null && (pFlags[i] & SCC_FILE_KEEPCHECKEDOUT) != 0;
 
                 string? repoPath = DiscoverRepositoryPath(filePath);
-                LogDiagnostic("AddCore", new Exception($"filePath='{filePath}' repoPath='{repoPath}'"));
+                LogDiagnostic("AddCore", new Exception($"filePath='{filePath}' repoPath='{repoPath}' keepCheckedOut={keepCheckedOut}"));
                 if (repoPath == null)
                 {
                     continue;
                 }
 
                 using var repo = OpenRepositoryEnsuringSafeDirectory(repoPath);
+
                 StageCommitAndPush(repo, filePath, comment);
+
+                if (keepCheckedOut)
+                {
+                    s_keptCheckedOutFiles[filePath] = 0;
+                }
+                else
+                {
+                    s_keptCheckedOutFiles.TryRemove(filePath, out _);
+                }
             }
 
             return SCC_OK;
@@ -812,6 +874,8 @@ public static class MsscciExports
         int fOptions,
         IntPtr pvConfig)
     {
+        LogDiagnostic("SccCheckout.Entry", new Exception($"nFiles={nFiles} fOptions=0x{fOptions:X}"));
+
         return ForEachFileRepo(nFiles, lpFileNames, pContext, (repo, filePath) =>
         {
             // No-op for Git: file is already writable/checked out on disk.
@@ -901,6 +965,15 @@ public static class MsscciExports
                 IntPtr rawPtr = (IntPtr)lpFileNames[i];
                 string filePath = ResolveEaPath(ReadFileNamePointer(rawPtr), pContext);
 
+                // Remember this resolved path as a fallback for the SccAdd call EA typically issues
+                // immediately afterward for the same file, in case that call's own pointer scan
+                // fails to recover a usable path from EA's memory buffer.
+                if (Path.IsPathRooted(filePath))
+                {
+                    s_lastQueryInfoResolvedPath = filePath;
+                    s_lastQueryInfoResolvedAt = DateTime.UtcNow;
+                }
+
                 string? repoPath = DiscoverRepositoryPath(filePath);
 
                 if (repoPath == null)
@@ -921,10 +994,8 @@ public static class MsscciExports
                 }
                 else if (fileStatus.HasFlag(FileStatus.NewInIndex))
                 {
-                    // Freshly staged (e.g. via SccAdd) but not yet committed. Unless the caller
-                    // explicitly requested to keep the file checked out, EA expects just
-                    // CONTROLLED here - reporting CHECKEDOUT/DIFFERENT for a plain add causes EA
-                    // to reject the status with "Unexpected status after adding file".
+                    // Staged but not yet committed.
+                    flags |= SCC_STATUS_CHECKEDOUT | SCC_STATUS_DIFFERENT;
                 }
                 else if (fileStatus.HasFlag(FileStatus.ModifiedInWorkdir) ||
                          fileStatus.HasFlag(FileStatus.ModifiedInIndex) ||
@@ -932,6 +1003,14 @@ public static class MsscciExports
                          fileStatus.HasFlag(FileStatus.DeletedFromIndex))
                 {
                     flags |= SCC_STATUS_CHECKEDOUT | SCC_STATUS_DIFFERENT;
+                }
+                else if (s_keptCheckedOutFiles.ContainsKey(filePath))
+                {
+                    // File is clean/committed (SccAdd always commits+pushes immediately now, even
+                    // with "Keep checked out" ticked, since Git has no real local-only staging
+                    // concept to honor), but the user asked to keep it checked out, so report it as
+                    // such rather than plain CONTROLLED until a real SccCheckin clears this flag.
+                    flags |= SCC_STATUS_CHECKEDOUT;
                 }
 
                 if (pStatus != null) pStatus[i] = flags;
@@ -1031,7 +1110,12 @@ public static class MsscciExports
     {
         if (rawPtr == IntPtr.Zero) return "";
 
-        const int scanWindow = 260; // MAX_PATH-ish, generous enough for the longest EA-supplied paths
+        // 260 (MAX_PATH-ish) was originally enough to find the real path in EA's buffer, but
+        // diagnostics later showed calls where only a short garbage prefix ("C:\Users.") exists
+        // within that window and the real path fragment must sit further away in memory - so the
+        // window is widened considerably to make recovery more reliable across EA's memory layout
+        // variations without meaningfully increasing scan cost.
+        const int scanWindow = 4096;
         try
         {
             byte[] window = new byte[scanWindow];
@@ -1057,14 +1141,15 @@ public static class MsscciExports
 
                 if (looksLikeDriveLetter || looksLikeUncPrefix)
                 {
-                    // Track the longest candidate that actually exists on disk (file or containing
-                    // directory). A truncated prefix like "C:\Users" can itself be a real, existing
-                    // directory, so we must keep scanning for a longer, more complete match before
-                    // deciding, rather than returning on the first hit.
+                    // Track the longest candidate that actually exists on disk as a file or
+                    // directory in its own right. We deliberately do NOT fall back to "does the
+                    // parent directory exist", since for a short garbage/truncated candidate like
+                    // "C:\Users(" that check is nearly always true (GetDirectoryName collapses it
+                    // to "C:\", which obviously exists) and would wrongly let this candidate win
+                    // over a longer, more complete candidate found elsewhere in the scan window.
                     try
                     {
-                        if (File.Exists(candidate) || Directory.Exists(candidate) ||
-                            Directory.Exists(Path.GetDirectoryName(candidate)))
+                        if (File.Exists(candidate) || Directory.Exists(candidate))
                         {
                             if (bestExistingCandidate == null || candidate.Length > bestExistingCandidate.Length)
                             {
