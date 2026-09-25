@@ -1605,7 +1605,11 @@ public static class MsscciExports
     }
 
     /// <summary>
-    /// Invokes the provider's own UI for a raw command. We have no such UI.
+    /// Invokes the provider's own UI for a raw command. EA calls this for "Start version control
+    /// explorer" (among other raw-command menu items), so rather than always failing with
+    /// SCC_E_OPNOTPERFORMED (which EA showed to the user as "Unknown SCC Error -30"), we treat it
+    /// as a request to browse the repository and simply open the repository root in Windows
+    /// Explorer - Git doesn't have a bundled repository browser UI of its own to launch here.
     /// </summary>
     [UnmanagedCallersOnly(EntryPoint = "SccRunScc", CallConvs = new[] { typeof(CallConvStdcall) })]
     public static unsafe int SccRunScc(
@@ -1614,7 +1618,39 @@ public static class MsscciExports
         int nFiles,
         sbyte** lpFileNames)
     {
-        return SCC_E_OPNOTPERFORMED;
+        try
+        {
+            string? repoPath = null;
+
+            if (nFiles > 0 && lpFileNames != null)
+            {
+                string filePath = ResolveEaPath(ReadPlainAnsiString((IntPtr)lpFileNames[0]), pContext);
+                repoPath = DiscoverRepositoryPath(filePath);
+            }
+
+            repoPath ??= s_lastOpenedProjectRoot;
+
+            LogDiagnostic("SccRunScc", new Exception($"nFiles={nFiles} repoPath='{repoPath}'"));
+
+            if (repoPath == null)
+            {
+                return SCC_E_FILENOTCONTROLLED;
+            }
+
+            System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo
+            {
+                FileName = "explorer.exe",
+                Arguments = $"\"{repoPath}\"",
+                UseShellExecute = true,
+            });
+
+            return SCC_OK;
+        }
+        catch (Exception ex)
+        {
+            LogDiagnostic("SccRunScc", ex);
+            return SCC_E_UNKNOWNERROR;
+        }
     }
 
     /// <summary>
