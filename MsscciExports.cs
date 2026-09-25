@@ -588,6 +588,48 @@ public static class MsscciExports
     }
 
     /// <summary>
+    /// Pulls (fetch + merge) the given branch from "origin" using the system "git" CLI rather than
+    /// LibGit2Sharp's Commands.Pull. Explicitly names the remote and branch ("git pull origin
+    /// &lt;branch&gt;") instead of relying on upstream tracking configuration (branch.&lt;name&gt;.remote /
+    /// branch.&lt;name&gt;.merge), since - unlike "git push", which can infer the target via
+    /// push.default=simple - a pull/merge needs an explicit source and would otherwise fail with
+    /// "There is no tracking information for the current branch" on branches that were never
+    /// explicitly configured for tracking (even though push to the same remote works fine). Also
+    /// picks up the configured credential helper (e.g. Git Credential Manager) the same way
+    /// PushViaGitCli does.
+    /// </summary>
+    private static void PullViaGitCli(string workingDirectory, string branchName)
+    {
+        var psi = new System.Diagnostics.ProcessStartInfo
+        {
+            FileName = "git",
+            ArgumentList = { "pull", "origin", branchName },
+            WorkingDirectory = workingDirectory,
+            UseShellExecute = false,
+            CreateNoWindow = true,
+            RedirectStandardOutput = true,
+            RedirectStandardError = true,
+        };
+
+        using var process = System.Diagnostics.Process.Start(psi);
+        if (process == null)
+        {
+            throw new InvalidOperationException("Failed to start 'git pull' process.");
+        }
+
+        string stdout = process.StandardOutput.ReadToEnd();
+        string stderr = process.StandardError.ReadToEnd();
+        process.WaitForExit(30000);
+
+        LogDiagnostic("PullViaGitCli", new Exception($"exitCode={process.ExitCode} stdout='{stdout}' stderr='{stderr}'"));
+
+        if (process.ExitCode != 0)
+        {
+            throw new InvalidOperationException($"'git pull' failed with exit code {process.ExitCode}: {stderr}");
+        }
+    }
+
+    /// <summary>
     /// Builds a fallback commit signature when Git's user.name/user.email aren't configured (e.g.
     /// not set in the global/system config visible to EA's process), since
     /// Repository.Config.BuildSignature returns null in that case and Repository.Commit throws
@@ -927,18 +969,26 @@ public static class MsscciExports
                 string filePath = ResolveEaPath(ReadPlainAnsiString((IntPtr)lpFileNames[i]), pContext);
 
                 string? repoPath = DiscoverRepositoryPath(filePath);
+                LogDiagnostic("GetCore", new Exception($"filePath='{filePath}' repoPath='{repoPath}'"));
                 if (repoPath == null) continue;
 
                 using var repo = OpenRepositoryEnsuringSafeDirectory(repoPath);
 
-                Signature signature = repo.Config.BuildSignature(DateTimeOffset.Now) ?? GetFallbackSignature(repo);
-                Commands.Pull(repo, signature, new PullOptions());
+                Remote? remote = repo.Network.Remotes["origin"];
+                if (remote == null)
+                {
+                    LogDiagnostic("GetCore", new Exception($"Skipping pull for repoPath='{repoPath}': no 'origin' remote configured"));
+                    continue;
+                }
+
+                PullViaGitCli(repo.Info.WorkingDirectory, repo.Head.FriendlyName);
             }
 
             return SCC_OK;
         }
-        catch
+        catch (Exception ex)
         {
+            LogDiagnostic("GetCore", ex);
             return SCC_E_UNKNOWNERROR;
         }
     }
@@ -1373,7 +1423,10 @@ public static class MsscciExports
 
     /// <summary>
     /// Shows a diff for a file. Not yet implemented against LibGit2Sharp; report as not performed
-    /// so EA can surface a clear message rather than silently doing nothing.
+    /// so EA can surface a clear message rather than silently doing nothing. Note: EA's "Compare
+    /// with controlled version" menu option does its own internal diff (against a copy fetched via
+    /// SccGet) rather than calling this export - confirmed via diagnostics showing SccDiff is
+    /// never invoked for that command - so this is unused by EA's most common comparison flow.
     /// </summary>
     [UnmanagedCallersOnly(EntryPoint = "SccDiff", CallConvs = new[] { typeof(CallConvStdcall) })]
     public static unsafe int SccDiff(
