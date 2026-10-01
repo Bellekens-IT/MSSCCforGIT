@@ -136,14 +136,29 @@ public static class MsscciExports
     /// <summary>
     /// Runs automatically when this assembly is loaded (before any exported Scc* function can be
     /// invoked), ensuring our own directory is added to the native DLL search path so LibGit2Sharp's
-    /// git2-*.dll (which sits next to us, not next to the host EA.exe) can be found.
+    /// git2-*.dll (which sits next to us, not next to the host EA.exe) can be found. Wrapped in a
+    /// try/catch because module initializers run unconditionally whenever this assembly is loaded
+    /// into ANY host process - not just EA.exe - including the WinForms designer's own isolated
+    /// "design tools server" process when opening HistoryForm/PropertiesForm in the visual
+    /// designer. An unhandled exception here would abort loading the assembly in that process too,
+    /// surfacing as "Failed to launch the design tools server process" - and this native DLL
+    /// search path setup isn't needed there anyway (no git/LibGit2Sharp calls happen at design time).
     /// </summary>
 #pragma warning disable CA2255 // Used intentionally in this native-hosted library to set up the
                                // DLL search path before EA calls into any exported Scc* function.
     [ModuleInitializer]
     internal static void Initialize()
     {
-        EnsureNativeDllDirectory();
+        try
+        {
+            EnsureNativeDllDirectory();
+        }
+        catch
+        {
+            // Best-effort only; EA's own Scc* calls will still fail clearly later (e.g. via
+            // DllNotFoundException from LibGit2Sharp) if this truly didn't work, but we must not
+            // let a module-initializer failure take down whatever process loaded this assembly.
+        }
     }
 #pragma warning restore CA2255
 
@@ -1467,7 +1482,7 @@ public static class MsscciExports
                 string relativePath = GetRelativePath(repo, filePath);
 
                 List<HistoryEntry> entries = GetFileHistoryViaGitCli(repo.Info.WorkingDirectory, relativePath);
-                MsscciDialogs.ShowHistory(hWnd, relativePath, entries);
+                HistoryForm.ShowHistory(hWnd, filePath, relativePath, entries);
             }
 
             return SCC_OK;
@@ -1563,7 +1578,7 @@ public static class MsscciExports
             LogDiagnostic("SccProperties", new Exception($"filePath='{filePath}' repoPath='{repoPath}'"));
             if (repoPath == null)
             {
-                MsscciDialogs.ShowProperties(hWnd, filePath, filePath, "(not in a Git repository)", "Not controlled", null);
+                PropertiesForm.ShowProperties(hWnd, filePath, filePath, "(not in a Git repository)", "Not controlled", null);
                 return SCC_OK;
             }
 
@@ -1574,7 +1589,7 @@ public static class MsscciExports
             List<HistoryEntry> lastCommitEntries = GetFileHistoryViaGitCli(repo.Info.WorkingDirectory, relativePath);
             HistoryEntry? lastCommit = lastCommitEntries.Count > 0 ? lastCommitEntries[0] : null;
 
-            MsscciDialogs.ShowProperties(hWnd, filePath, relativePath, repoPath, fileStatus.ToString(), lastCommit);
+            PropertiesForm.ShowProperties(hWnd, filePath, relativePath, repoPath, fileStatus.ToString(), lastCommit);
 
             return SCC_OK;
         }
