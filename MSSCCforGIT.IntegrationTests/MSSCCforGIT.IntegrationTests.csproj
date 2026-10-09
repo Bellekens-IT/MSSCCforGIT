@@ -1,0 +1,45 @@
+﻿<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net10.0-windows</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <IsPackable>false</IsPackable>
+    <!-- EA only registers a 32-bit COM server (EA.App / EA.Repository); the test process must
+         match that bitness to create the COM object. -->
+    <PlatformTarget>x86</PlatformTarget>
+    <!-- Tests run sequentially: they all drive the single EA.exe instance and share the Test
+         git repo, so parallel test collections would corrupt shared state. -->
+    <DisableTestParallelization>true</DisableTestParallelization>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="coverlet.collector" Version="6.0.4" />
+    <PackageReference Include="Microsoft.NET.Test.Sdk" Version="17.14.1" />
+    <PackageReference Include="xunit" Version="2.9.3" />
+    <PackageReference Include="xunit.runner.visualstudio" Version="3.1.4" />
+    <PackageReference Include="LibGit2Sharp" Version="0.32.0" />
+    <!-- Used to drive EA's actual UI (Project Browser tree + context menus) for version-control
+         actions, since EA's VersionControlCheckout/Checkin Automation methods throw an opaque
+         COMException (confirmed unrelated to this provider - reproduced against TFS too), while
+         the same actions work fine when triggered the way a real user would, through the UI. -->
+    <PackageReference Include="FlaUI.Core" Version="5.0.0" />
+    <PackageReference Include="FlaUI.UIA3" Version="5.0.0" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- EA ships its own interop assembly alongside EA.exe; reference it directly instead of
+         regenerating one via tlbimp, embedding the interop types so no PIA is required at
+         runtime (the installed EA.exe still has to be present to actually create the COM object). -->
+    <Reference Include="Interop.EA">
+      <HintPath>C:\Program Files (x86)\Sparx Systems\EA\Interop.EA.dll</HintPath>
+      <EmbedInteropTypes>true</EmbedInteropTypes>
+      <Private>false</Private>
+    </Reference>
+  </ItemGroup>
+
+  <ItemGroup>
+    <Using Include="Xunit" />
+  </ItemGroup>
+
+</Project>
