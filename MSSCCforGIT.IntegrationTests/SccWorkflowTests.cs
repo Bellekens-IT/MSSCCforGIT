@@ -16,6 +16,12 @@ namespace MSSCCforGIT.IntegrationTests;
 [Collection(EaTestCollection.Name)]
 public sealed class SccWorkflowTests
 {
+    /// <summary>
+    /// GUID of the package in Test\TestProject.qea that is already under version control, used
+    /// as a fixed starting point instead of looking packages up by name.
+    /// </summary>
+    private const string TestPackageGuid = "{0E0C7598-7B9F-42fc-BEBE-9D4AAEE28578}";
+
     private readonly EaTestFixture _fixture;
 
     public SccWorkflowTests(EaTestFixture fixture)
@@ -29,13 +35,13 @@ public sealed class SccWorkflowTests
     [Fact]
     public void Checkout_VersionControlledPackage_InvokesProviderAndMarksFileWritable()
     {
-        var package = _fixture.StaThread.Invoke(() => FindPackageByName(_fixture.EaRepository, "TestPackage1"));
+        var package = _fixture.StaThread.Invoke(() => FindPackageByGuid(_fixture.EaRepository, TestPackageGuid));
         Assert.True(_fixture.StaThread.Invoke(() => package.IsVersionControlled), "Fixture package must already be under version control.");
 
         _fixture.StaThread.Invoke(() => package.VersionControlCheckout("Integration test checkout"));
         try
         {
-            var filePath = Path.Combine(_fixture.TestRepoPath, "TestPackage1.xml");
+            var filePath = Path.Combine(_fixture.TestRepoPath, $"{package.Name}.xml");
             Assert.True(IOFile.Exists(filePath), $"Expected package file at '{filePath}'.");
 
             var log = _fixture.ReadDiagnosticLog();
@@ -52,7 +58,7 @@ public sealed class SccWorkflowTests
     [Fact]
     public void Checkin_ModifiedVersionControlledPackage_CommitsChangeToGit()
     {
-        var package = _fixture.StaThread.Invoke(() => FindPackageByName(_fixture.EaRepository, "TestPackage1"));
+        var package = _fixture.StaThread.Invoke(() => FindPackageByGuid(_fixture.EaRepository, TestPackageGuid));
 
         using var repoBefore = new LibGit2Sharp.Repository(_fixture.GitRepoRoot);
         var commitCountBefore = repoBefore.Commits.Count();
@@ -78,8 +84,8 @@ public sealed class SccWorkflowTests
     [Fact]
     public void GetLatest_AfterExternalCommit_UpdatesWorkingCopyFromGit()
     {
-        var package = _fixture.StaThread.Invoke(() => FindPackageByName(_fixture.EaRepository, "TestPackage1"));
-        var filePath = Path.Combine(_fixture.TestRepoPath, "TestPackage1.xml");
+        var package = _fixture.StaThread.Invoke(() => FindPackageByGuid(_fixture.EaRepository, TestPackageGuid));
+        var filePath = Path.Combine(_fixture.TestRepoPath, $"{package.Name}.xml");
 
         var originalContent = IOFile.ReadAllText(filePath);
         Assert.DoesNotContain("Approved", originalContent);
@@ -119,7 +125,7 @@ public sealed class SccWorkflowTests
         // EA enforces the "parent package is locked by Version Control" rule for any structural
         // change (including adding a new child) under a package that is already under version
         // control, so the parent must be checked out first.
-        var parent = _fixture.StaThread.Invoke(() => FindPackageByName(_fixture.EaRepository, "TestPackage1"));
+        var parent = _fixture.StaThread.Invoke(() => FindPackageByGuid(_fixture.EaRepository, TestPackageGuid));
         _fixture.StaThread.Invoke(() => parent.VersionControlCheckout("Integration test checkout for Add"));
         try
         {
@@ -153,7 +159,7 @@ public sealed class SccWorkflowTests
     [Fact]
     public void GetStatus_ControlledPackage_ReturnsControlledStatus()
     {
-        var package = _fixture.StaThread.Invoke(() => FindPackageByName(_fixture.EaRepository, "TestPackage1"));
+        var package = _fixture.StaThread.Invoke(() => FindPackageByGuid(_fixture.EaRepository, TestPackageGuid));
 
         var status = _fixture.StaThread.Invoke(() => package.VersionControlGetStatus());
 
@@ -163,14 +169,14 @@ public sealed class SccWorkflowTests
         // a live round-trip through the provider's SccQueryInfo export, so there's no provider log
         // entry to assert on here (unlike the other VersionControl* tests, which do invoke
         // provider exports directly).
-        Assert.True(status != 0, $"Expected a non-zero (controlled) VersionControlGetStatus() for TestPackage1, got {status}.");
+        Assert.True(status != 0, $"Expected a non-zero (controlled) VersionControlGetStatus() for the test package, got {status}.");
     }
 
     [Fact]
     public void Remove_VersionControlledPackage_InvokesProvider()
     {
         var newPackageName = $"IntegrationTestPackage_{Guid.NewGuid():N}";
-        var parent = _fixture.StaThread.Invoke(() => FindPackageByName(_fixture.EaRepository, "TestPackage1"));
+        var parent = _fixture.StaThread.Invoke(() => FindPackageByGuid(_fixture.EaRepository, TestPackageGuid));
 
         // Both adding and removing a child package under a controlled parent are structural
         // changes, so the parent must be checked out first or EA throws "Cannot create new
@@ -212,7 +218,7 @@ public sealed class SccWorkflowTests
     [Fact]
     public void PutLatest_ModifiedCheckedOutPackage_InvokesProvider()
     {
-        var package = _fixture.StaThread.Invoke(() => FindPackageByName(_fixture.EaRepository, "TestPackage1"));
+        var package = _fixture.StaThread.Invoke(() => FindPackageByGuid(_fixture.EaRepository, TestPackageGuid));
 
         _fixture.StaThread.Invoke(() =>
         {
@@ -254,40 +260,19 @@ public sealed class SccWorkflowTests
         repo.Commit(message, signature, signature);
     }
 
-    private static Package FindPackageByName(EA.Repository eaRepository, string name)
+    /// <summary>
+    /// Looks up a package directly by its fixed GUID via EA's Repository.GetPackageByGuid,
+    /// instead of walking the package tree by name (which breaks whenever the fixture project's
+    /// package names change).
+    /// </summary>
+    private static Package FindPackageByGuid(EA.Repository eaRepository, string guid)
     {
-        var models = eaRepository.Models;
-        for (var i = 0; i < models.Count; i++)
+        var package = (Package)eaRepository.GetPackageByGuid(guid);
+        if (package is null)
         {
-            var model = (Package)models.GetAt((short)i);
-            var found = FindPackageByNameRecursive(model, name);
-            if (found is not null)
-            {
-                return found;
-            }
+            throw new InvalidOperationException($"Package '{guid}' was not found in the test project.");
         }
 
-        throw new InvalidOperationException($"Package '{name}' was not found in the test project.");
-    }
-
-    private static Package? FindPackageByNameRecursive(Package package, string name)
-    {
-        if (string.Equals(package.Name, name, StringComparison.OrdinalIgnoreCase))
-        {
-            return package;
-        }
-
-        var children = package.Packages;
-        for (var i = 0; i < children.Count; i++)
-        {
-            var child = (Package)children.GetAt((short)i);
-            var found = FindPackageByNameRecursive(child, name);
-            if (found is not null)
-            {
-                return found;
-            }
-        }
-
-        return null;
+        return package;
     }
 }
