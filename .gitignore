@@ -7,3 +7,4 @@ EANavigator_Setup/bin/Debug/EANavigator_Setup.wixpdb
 *.vsp
 bin
 obj
+*.trx
