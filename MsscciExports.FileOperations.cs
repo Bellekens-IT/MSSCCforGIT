@@ -192,7 +192,11 @@ public static partial class MsscciExports
 
     /// <summary>
     /// Git has no exclusive locking model, so SccCheckout simply ensures the file exists
-    /// in the working directory and is up to date; no lock is taken.
+    /// in the working directory and is up to date; no lock is taken. However, EA queries the
+    /// file's status (SccQueryInfo) immediately after this call to confirm the checkout actually
+    /// took effect, and fails with an error if it doesn't come back as checked out - so the file
+    /// is recorded in s_keptCheckedOutFiles (the same mechanism SccAdd's "keep checked out" option
+    /// uses) until a real SccCheckin/SccUncheckout clears it.
     /// </summary>
     [UnmanagedCallersOnly(EntryPoint = "SccCheckout", CallConvs = new[] { typeof(CallConvStdcall) })]
     public static unsafe int SccCheckout(
@@ -208,12 +212,13 @@ public static partial class MsscciExports
 
         return ForEachFileRepo(nFiles, lpFileNames, pContext, (repo, filePath) =>
         {
-            // No-op for Git: file is already writable/checked out on disk.
+            s_keptCheckedOutFiles[filePath] = 0;
         });
     }
 
     /// <summary>
-    /// Map SccUncheckout to discarding local changes (git checkout -- file), reverting to HEAD.
+    /// Map SccUncheckout to discarding local changes (git checkout -- file), reverting to HEAD,
+    /// and clearing the checked-out flag set by SccCheckout so SccQueryInfo reports CONTROLLED again.
     /// </summary>
     [UnmanagedCallersOnly(EntryPoint = "SccUncheckout", CallConvs = new[] { typeof(CallConvStdcall) })]
     public static unsafe int SccUncheckout(
@@ -227,6 +232,7 @@ public static partial class MsscciExports
         {
             string relativePath = GetRelativePath(repo, filePath);
             repo.CheckoutPaths("HEAD", new[] { relativePath }, new CheckoutOptions { CheckoutModifiers = CheckoutModifiers.Force });
+            s_keptCheckedOutFiles.TryRemove(filePath, out _);
         });
     }
 
@@ -317,36 +323,48 @@ public static partial class MsscciExports
                 using var repo = OpenRepositoryEnsuringSafeDirectory(repoPath);
                 string relativePath = GetRelativePath(repo, filePath);
 
-                FileStatus fileStatus = repo.RetrieveStatus(relativePath);
                 int flags = SCC_STATUS_CONTROLLED;
 
-                if (fileStatus.HasFlag(FileStatus.NewInWorkdir) || fileStatus.HasFlag(FileStatus.Nonexistent))
+                if (s_pendingCommittedFiles.ContainsKey(filePath))
                 {
-                    flags = SCC_STATUS_NOTCONTROLLED;
+                    // SccCheckin was already called for this file, but the real commit+push is
+                    // still debounced (see MsscciExports.CheckinBatching.cs) - report it as
+                    // already checked in regardless of Git's still-dirty-until-then status, since
+                    // EA queries this right after SccCheckin and fails the checkin if it doesn't
+                    // come back as controlled.
                 }
-                else if (fileStatus.HasFlag(FileStatus.NewInIndex))
+                else
                 {
-                    // Staged but not yet committed.
-                    flags |= SCC_STATUS_CHECKEDOUT | SCC_STATUS_DIFFERENT;
-                }
-                else if (fileStatus.HasFlag(FileStatus.ModifiedInWorkdir) ||
-                         fileStatus.HasFlag(FileStatus.ModifiedInIndex) ||
-                         fileStatus.HasFlag(FileStatus.DeletedFromWorkdir) ||
-                         fileStatus.HasFlag(FileStatus.DeletedFromIndex))
-                {
-                    flags |= SCC_STATUS_CHECKEDOUT | SCC_STATUS_DIFFERENT;
-                }
-                else if (s_keptCheckedOutFiles.ContainsKey(filePath))
-                {
-                    // File is clean/committed (SccAdd always commits+pushes immediately now, even
-                    // with "Keep checked out" ticked, since Git has no real local-only staging
-                    // concept to honor), but the user asked to keep it checked out, so report it as
-                    // such rather than plain CONTROLLED until a real SccCheckin clears this flag.
-                    flags |= SCC_STATUS_CHECKEDOUT;
+                    FileStatus fileStatus = repo.RetrieveStatus(relativePath);
+
+                    if (fileStatus.HasFlag(FileStatus.NewInWorkdir) || fileStatus.HasFlag(FileStatus.Nonexistent))
+                    {
+                        flags = SCC_STATUS_NOTCONTROLLED;
+                    }
+                    else if (fileStatus.HasFlag(FileStatus.NewInIndex))
+                    {
+                        // Staged but not yet committed.
+                        flags |= SCC_STATUS_CHECKEDOUT | SCC_STATUS_DIFFERENT;
+                    }
+                    else if (fileStatus.HasFlag(FileStatus.ModifiedInWorkdir) ||
+                             fileStatus.HasFlag(FileStatus.ModifiedInIndex) ||
+                             fileStatus.HasFlag(FileStatus.DeletedFromWorkdir) ||
+                             fileStatus.HasFlag(FileStatus.DeletedFromIndex))
+                    {
+                        flags |= SCC_STATUS_CHECKEDOUT | SCC_STATUS_DIFFERENT;
+                    }
+                    else if (s_keptCheckedOutFiles.ContainsKey(filePath))
+                    {
+                        // File is clean/committed (SccAdd always commits+pushes immediately now, even
+                        // with "Keep checked out" ticked, since Git has no real local-only staging
+                        // concept to honor), but the user asked to keep it checked out, so report it as
+                        // such rather than plain CONTROLLED until a real SccCheckin clears this flag.
+                        flags |= SCC_STATUS_CHECKEDOUT;
+                    }
                 }
 
                 if (pStatus != null) pStatus[i] = flags;
-                LogDiagnostic("SccQueryInfo", new Exception($"relativePath='{relativePath}' fileStatus={fileStatus} flags={flags}"));
+                LogDiagnostic("SccQueryInfo", new Exception($"relativePath='{relativePath}' flags={flags}"));
             }
 
             return SCC_OK;
@@ -372,6 +390,20 @@ public static partial class MsscciExports
             {
                 IntPtr rawPtr = (IntPtr)lpFileNames[i];
                 string filePath = ResolveEaPath(ReadPlainAnsiString(rawPtr), pContext);
+
+                // This call's own lpFileNames pointer has proven just as unreliable to read
+                // directly as SccAdd's (EA's buffer layout for it varies across calls and
+                // sometimes yields a truncated/garbage path like "Test\D"). EA reliably calls
+                // SccQueryInfo for a file right before SccCheckout/SccUncheckout/SccRemove for
+                // that same file, and that call's path resolution has proven completely
+                // reliable, so prefer the path cached from that preceding SccQueryInfo call
+                // whenever it was resolved recently; only fall back to this call's own
+                // (possibly corrupted) pointer if no recent cached path is available.
+                if (s_lastQueryInfoResolvedPath != null &&
+                    DateTime.UtcNow - s_lastQueryInfoResolvedAt < TimeSpan.FromSeconds(5))
+                {
+                    filePath = s_lastQueryInfoResolvedPath;
+                }
 
                 string? repoPath = DiscoverRepositoryPath(filePath);
                 LogDiagnostic("ForEachFileRepo", new Exception($"filePath='{filePath}' repoPath='{repoPath}'"));

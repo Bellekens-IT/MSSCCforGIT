@@ -27,6 +27,18 @@ public static partial class MsscciExports
     private static readonly TimeSpan PendingCheckinDebounce = TimeSpan.FromSeconds(5);
 
     /// <summary>
+    /// Files SccCheckin has accepted but whose real commit+push is still pending behind the
+    /// debounce timer above. EA queries each file's status (SccQueryInfo) immediately after
+    /// SccCheckin to confirm the checkin actually took effect, and reports "Check-in failed" if
+    /// it still comes back as modified/checked-out at that point - but the real commit may still
+    /// be seconds away. So SccQueryInfo treats any file recorded here as already checked in
+    /// (CONTROLLED) rather than reporting Git's still-dirty-until-the-debounced-commit status.
+    /// Cleared for each file once its real commit+push actually runs.
+    /// </summary>
+    private static readonly System.Collections.Concurrent.ConcurrentDictionary<string, byte> s_pendingCommittedFiles =
+        new(StringComparer.OrdinalIgnoreCase);
+
+    /// <summary>
     /// Resets the pending-checkin debounce timer if a batch is currently accumulating. Called only
     /// from SccQueryInfo, since EA issuing that call right after SccCheckin is a routine per-file
     /// status refresh rather than a sign EA has moved on to a different operation.
@@ -66,6 +78,7 @@ public static partial class MsscciExports
             s_pendingCheckinTimer = null;
         }
 
+        ClearPendingCommittedMarkers(filesByRepo);
         CommitAndPushFiles(filesByRepo, comment ?? "EA Checkin");
     }
 
@@ -114,6 +127,11 @@ public static partial class MsscciExports
 
                 // A real SccCheckin clears any "keep checked out" flag left over from SccAdd.
                 s_keptCheckedOutFiles.TryRemove(filePath, out _);
+
+                // The real commit+push for this file is debounced (see below), but EA queries
+                // status right after this call returns and expects to see it as checked in
+                // already - so report it that way until the debounced commit actually clears it.
+                s_pendingCommittedFiles[filePath] = 0;
             }
 
             // EA calls SccCheckin once per individual file even for a multi-file "checkin branch"
@@ -168,6 +186,7 @@ public static partial class MsscciExports
 
             if (filesToFlushNow != null && commentToFlushNow != null)
             {
+                ClearPendingCommittedMarkers(filesToFlushNow);
                 CommitAndPushFiles(filesToFlushNow, commentToFlushNow);
             }
 
@@ -203,6 +222,22 @@ public static partial class MsscciExports
             s_pendingCheckinTimer = null;
         }
 
+        ClearPendingCommittedMarkers(filesByRepo);
         CommitAndPushFiles(filesByRepo, comment);
+    }
+
+    /// <summary>
+    /// Removes the pending-committed marker for every file about to be committed+pushed, since
+    /// after this point Git's own status for them will correctly reflect the real commit.
+    /// </summary>
+    private static void ClearPendingCommittedMarkers(Dictionary<string, List<string>> filesByRepo)
+    {
+        foreach (var filePaths in filesByRepo.Values)
+        {
+            foreach (var filePath in filePaths)
+            {
+                s_pendingCommittedFiles.TryRemove(filePath, out _);
+            }
+        }
     }
 }
