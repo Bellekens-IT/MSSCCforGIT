@@ -88,9 +88,13 @@ public sealed class SccWorkflowTests
         var filePath = Path.Combine(_fixture.TestRepoPath, $"{package.Name}.xml");
 
         var originalContent = IOFile.ReadAllText(filePath);
-        Assert.DoesNotContain("Approved", originalContent);
+        var marker = $"GetLatestMarker_{Guid.NewGuid():N}";
+        Assert.DoesNotContain(marker, originalContent);
 
-        var externalContent = originalContent.Replace("Proposed", "Approved");
+        // Append the marker as an XML comment so the change is well-formed regardless of the
+        // package's actual content, instead of relying on specific text (e.g. "Proposed") that
+        // may not exist in every fixture package.
+        var externalContent = originalContent + $"<!-- {marker} -->";
         CommitExternalChange(filePath, externalContent, "External commit for GetLatest test");
 
         // Restore the working copy to its pre-external-change state so VersionControlGetLatest
@@ -100,7 +104,7 @@ public sealed class SccWorkflowTests
         _fixture.StaThread.Invoke(() => package.VersionControlGetLatest(false));
 
         var localContentAfterGet = IOFile.ReadAllText(filePath);
-        Assert.Contains("Approved", localContentAfterGet);
+        Assert.Contains(marker, localContentAfterGet);
 
         var log = _fixture.ReadDiagnosticLog();
         Assert.Contains("GetCore", log);
