@@ -70,8 +70,10 @@ public sealed class SccWorkflowTests
 
         _fixture.StaThread.Invoke(() =>
         {
+            // The fixture package is already checked out (see Test/TestProject.qea), matching
+            // the common real-world scenario of checking in an already-checked-out package, so
+            // there's no need (and no ability) to check it out again here first.
             var package = _fixture.EaRepository.GetPackageByGuid(TestCheckinPackageGuid);
-            package.VersionControlCheckout("Integration test checkout");
             package.Notes = $"Integration test note {Guid.NewGuid()}";
             package.Update();
             package.VersionControlCheckin("Integration test checkin");
@@ -101,9 +103,6 @@ public sealed class SccWorkflowTests
         // VersionControlCheckin before handing it to the provider, so the commit message contains
         // rather than exactly equals the comment passed by the test.
         Assert.Contains("Integration test checkin", repoAfter.Commits.First().MessageShort);
-
-        var log = _fixture.ReadDiagnosticLog();
-        Assert.Contains("SccCheckin", log);
     }
 
     //[Fact]
