@@ -1,0 +1,74 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Project ToolsVersion="4.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003" DefaultTargets="Build">
+  <PropertyGroup>
+    <ProjectGuid>{44d4f1be-4807-9ee8-3460-2289d2b1818c}</ProjectGuid>
+    <Configuration Condition=" '$(Configuration)' == '' ">Release</Configuration>
+    <Platform Condition=" '$(Platform)' == '' ">x86</Platform>
+    <OutputType>Package</OutputType>
+    <RootNamespace>MSSCCforGIT.Setup</RootNamespace>
+    <OutputName>MSSCCforGIT_Setup_$(Platform)</OutputName>
+    <WixTargetsPath Condition=" '$(WixTargetsPath)' == '' AND '$(MSBuildExtensionsPath32)' != '' ">$(MSBuildExtensionsPath32)\Microsoft\WiX\v3.x\Wix.targets</WixTargetsPath>
+    <WixTargetsPath Condition=" '$(WixTargetsPath)' == '' ">$(MSBuildExtensionsPath)\Microsoft\WiX\v3.x\Wix.targets</WixTargetsPath>
+    <SuppressIces>ICE45;ICE91</SuppressIces>
+    <WixVariables>WixUILicenseRtf=license.rtf</WixVariables>
+    <IntermediateOutputPath>obj\$(Platform)\$(Configuration)\</IntermediateOutputPath>
+  </PropertyGroup>
+  <!--
+	This installer only ever builds for x86 or x64 (never AnyCPU): MSSCCforGIT.dll is a native,
+	bitness-specific DLL that must match the bitness of the Enterprise Architect process loading
+	it, so there is no single installer that works for both - this project instead produces one
+	MSI per platform, selected via the $(Platform) property (matching how the published
+	MSSCCforGIT.dll itself is produced per-RID).
+  -->
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)' == 'Debug|x86'">
+    <OutputPath>bin\Debug\</OutputPath>
+    <DebugSymbols>True</DebugSymbols>
+    <DebugType>Full</DebugType>
+    <Optimize>False</Optimize>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)' == 'Debug|x64'">
+    <OutputPath>bin\x64\Debug\</OutputPath>
+    <DebugSymbols>True</DebugSymbols>
+    <DebugType>Full</DebugType>
+    <Optimize>False</Optimize>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)' == 'Release|x86'">
+    <OutputPath>bin\Release\</OutputPath>
+    <DebugSymbols>False</DebugSymbols>
+    <DebugType>None</DebugType>
+    <Optimize>True</Optimize>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)' == 'Release|x64'">
+    <OutputPath>bin\x64\Release\</OutputPath>
+    <DebugSymbols>False</DebugSymbols>
+    <DebugType>None</DebugType>
+    <Optimize>True</Optimize>
+  </PropertyGroup>
+  <ItemGroup>
+    <WixExtension Include="WixUIExtension.dll">
+      <HintPath>WixUIExtension.dll</HintPath>
+      <Name>WixUIExtension.dll</Name>
+    </WixExtension>
+  </ItemGroup>
+  <ItemGroup>
+    <Compile Include="Files.wxs" />
+    <Compile Include="Setup.wxs" />
+  </ItemGroup>
+  <ItemGroup>
+    <None Include="license.rtf" />
+  </ItemGroup>
+  <Import Project="$(WixTargetsPath)" />
+  <!--
+	Fails fast with a clear message instead of a confusing WiX "file not found" error if the
+	matching Release publish output (produced by MSSCCforGIT.csproj's PublishNativeAot target /
+	`dotnet publish -r win-x86|win-x64`) hasn't been built yet for the platform being packaged.
+  -->
+  <Target Name="EnsureProviderPublished" BeforeTargets="BeforeBuild">
+    <PropertyGroup>
+      <_ProviderRid Condition="'$(Platform)' == 'x64'">win-x64</_ProviderRid>
+      <_ProviderRid Condition="'$(Platform)' != 'x64'">win-x86</_ProviderRid>
+      <_ProviderDllPath>$(MSBuildThisFileDirectory)..\bin\Release\net10.0-windows\$(_ProviderRid)\publish\MSSCCforGIT.dll</_ProviderDllPath>
+    </PropertyGroup>
+    <Error Condition="!Exists('$(_ProviderDllPath)')" Text="Could not find '$(_ProviderDllPath)'. Build MSSCCforGIT.csproj in Release mode first (it auto-publishes both win-x86 and win-x64 outputs)." />
+  </Target>
+</Project>

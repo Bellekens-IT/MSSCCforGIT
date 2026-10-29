@@ -1,0 +1,79 @@
+<?xml version="1.0"?>
+<Wix xmlns="http://schemas.microsoft.com/wix/2006/wi">
+	<?if $(var.Platform) = x64 ?>
+	<?define PlatformName = "(64-bit)" ?>
+	<?define ProviderRid = "win-x64" ?>
+	<?define Win64 = "yes" ?>
+	<?define PlatformProgramFilesFolder = "ProgramFiles64Folder" ?>
+	<?define SccRegistryRoot = "SOFTWARE\SourceCodeControlProvider\InstalledSCCProviders" ?>
+	<?define BellekensRegistryRoot = "SOFTWARE\Bellekens\Bellekens GIT MSSCCI" ?>
+	<?define UpgradeCode = "9E9A7F0E-9E36-4B2C-9F4E-2E9C2B9C9A64" ?>
+	<?else?>
+	<?define PlatformName = "(32-bit)" ?>
+	<?define ProviderRid = "win-x86" ?>
+	<?define Win64 = "no" ?>
+	<?define PlatformProgramFilesFolder = "ProgramFilesFolder" ?>
+	<!-- 32-bit EA on 64-bit Windows looks for its SCC provider registration under the WOW6432Node
+		 hive - see RegisterMSSCCforGIT.reg for the equivalent manual registration this mirrors. -->
+	<?define SccRegistryRoot = "SOFTWARE\WOW6432Node\SourceCodeControlProvider\InstalledSCCProviders" ?>
+	<?define BellekensRegistryRoot = "SOFTWARE\WOW6432Node\Bellekens\Bellekens GIT MSSCCI" ?>
+	<?define UpgradeCode = "D045EDD5-3B67-4B68-BDC0-41E992E111A8" ?>
+	<?endif?>
+
+	<Product Id="*"
+		  Name="MSSCCforGIT $(var.PlatformName)"
+		  Language="1033"
+		  Version="1.0.0.0"
+		  UpgradeCode="$(var.UpgradeCode)"
+		  Manufacturer="Bellekens">
+		<Package Description="Installs MSSCCforGIT $(var.PlatformName) on this computer"
+				Comments="A Git-backed MSSCCI source control provider for Sparx Systems Enterprise Architect"
+		InstallerVersion="200"
+		Compressed="yes"
+		InstallScope="perMachine"
+		Platform="$(var.Platform)"/>
+
+		<Property Id="ARPHELPLINK" Value="https://github.com/Bellekens-IT/MSSCCforGIT" />
+
+		<Media Id="1" Cabinet="contents.cab" EmbedCab="yes" CompressionLevel="high"/>
+
+		<Upgrade Id="$(var.UpgradeCode)">
+			<UpgradeVersion Minimum="1.0.0.0"
+						  IncludeMinimum="no"
+						  OnlyDetect="yes"
+						  Language="1033"
+						  Property="NEWPRODUCTFOUND" />
+			<UpgradeVersion Minimum="0.0.0.0"
+							IncludeMinimum="yes"
+							Maximum="1.0.0.0"
+							IncludeMaximum="no"
+							Language="1033"
+							Property="UPGRADEFOUND" />
+		</Upgrade>
+
+		<!-- Installation directory and files are defined in Files.wxs -->
+		<Directory Id="TARGETDIR" Name="SourceDir"/>
+
+		<Feature Id="MSSCCforGIT"
+			 Title="MSSCCforGIT"
+			 Description="Git-backed MSSCCI source control provider for Enterprise Architect"
+			 Level="1"
+			 Absent="disallow">
+			<ComponentRef Id="ProviderFiles"/>
+			<ComponentRef Id="ProviderRegistryEntry"/>
+		</Feature>
+
+		<CustomAction Id="PreventDowngrading" Error="A newer version of MSSCCforGIT $(var.PlatformName) is already installed." />
+
+		<InstallExecuteSequence>
+			<Custom Action="PreventDowngrading" After="FindRelatedProducts">NEWPRODUCTFOUND</Custom>
+			<RemoveExistingProducts After="InstallValidate" />
+		</InstallExecuteSequence>
+
+		<InstallUISequence>
+			<Custom Action="PreventDowngrading" After="FindRelatedProducts">NEWPRODUCTFOUND</Custom>
+		</InstallUISequence>
+
+		<UIRef Id="WixUI_Minimal"/>
+	</Product>
+</Wix>

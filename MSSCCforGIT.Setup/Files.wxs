@@ -1,0 +1,52 @@
+<?xml version="1.0"?>
+<Wix xmlns="http://schemas.microsoft.com/wix/2006/wi">
+	<?if $(var.Platform) = x64 ?>
+	<?define PlatformName = "(64-bit)" ?>
+	<?define ProviderRid = "win-x64" ?>
+	<?define Win64 = "yes" ?>
+	<?define PlatformProgramFilesFolder = "ProgramFiles64Folder" ?>
+	<?define SccRegistryRoot = "SOFTWARE\SourceCodeControlProvider\InstalledSCCProviders" ?>
+	<?define BellekensRegistryRoot = "SOFTWARE\Bellekens\Bellekens GIT MSSCCI" ?>
+	<?define UpgradeCode = "9E9A7F0E-9E36-4B2C-9F4E-2E9C2B9C9A64" ?>
+	<?else?>
+	<?define PlatformName = "(32-bit)" ?>
+	<?define ProviderRid = "win-x86" ?>
+	<?define Win64 = "no" ?>
+	<?define PlatformProgramFilesFolder = "ProgramFilesFolder" ?>
+	<!-- 32-bit EA on 64-bit Windows looks for its SCC provider registration under the WOW6432Node
+		 hive - see RegisterMSSCCforGIT.reg for the equivalent manual registration this mirrors. -->
+	<?define SccRegistryRoot = "SOFTWARE\WOW6432Node\SourceCodeControlProvider\InstalledSCCProviders" ?>
+	<?define BellekensRegistryRoot = "SOFTWARE\WOW6432Node\Bellekens\Bellekens GIT MSSCCI" ?>
+	<?define UpgradeCode = "D045EDD5-3B67-4B68-BDC0-41E992E111A8" ?>
+	<?endif?>
+
+	<Fragment>
+		<DirectoryRef Id="TARGETDIR">
+			<Directory Id="$(var.PlatformProgramFilesFolder)" Name="PFiles">
+				<Directory Id="BellekensDir" Name="Bellekens">
+					<Directory Id="INSTALLFOLDER" Name="MSSCCforGIT">
+						<Component Id="ProviderFiles" Guid="12227597-9361-4912-AC2A-D69211543BC4" Win64="$(var.Win64)">
+							<File Id="MSSCCforGIT.dll" Name="MSSCCforGIT.dll" Source="..\bin\Release\net10.0-windows\$(var.ProviderRid)\publish\MSSCCforGIT.dll" KeyPath="yes" />
+							<File Id="git2.dll" Name="git2-5853918.dll" Source="..\bin\Release\net10.0-windows\$(var.ProviderRid)\publish\git2-5853918.dll" />
+						</Component>
+
+						<!--
+							Registers the provider so EA can discover it (see RegisterMSSCCforGIT.reg for the
+							manual equivalent this mirrors). SccRegistryRoot/BellekensRegistryRoot already
+							account for the WOW6432Node hive on the x86 build (see Setup.wxs).
+						-->
+						<Component Id="ProviderRegistryEntry" Guid="A13B6735-1880-4FA6-AD5B-808467CF6ACB" Win64="$(var.Win64)">
+							<RegistryKey Root="HKLM" Key="$(var.SccRegistryRoot)">
+								<RegistryValue Name="Bellekens GIT MSSCCI" Value="SOFTWARE\Bellekens\Bellekens GIT MSSCCI" Type="string" Action="write" />
+							</RegistryKey>
+							<RegistryKey Root="HKLM" Key="$(var.BellekensRegistryRoot)">
+								<RegistryValue Name="SCCServerName" Value="Bellekens GIT MSSCCI" Type="string" Action="write" />
+								<RegistryValue Name="SCCServerPath" Value="[INSTALLFOLDER]MSSCCforGIT.dll" Type="string" Action="write" />
+							</RegistryKey>
+						</Component>
+					</Directory>
+				</Directory>
+			</Directory>
+		</DirectoryRef>
+	</Fragment>
+</Wix>

@@ -12,7 +12,10 @@
 			 .cs/.Designer.cs file to open it visually fails with "Failed to launch the design tools
 			 server process"). -->
 		<PublishAot Condition="'$(_IsPublishing)' == 'true'">true</PublishAot>
-		<RuntimeIdentifier Condition="'$(_IsPublishing)' == 'true'">win-x86</RuntimeIdentifier>
+		<!-- Defaults to win-x86 (EA is normally 32-bit), but can be overridden, e.g.
+			 `-p:PublishRuntimeIdentifier=win-x64`, to publish for 64-bit EA instead. -->
+		<PublishRuntimeIdentifier Condition="'$(PublishRuntimeIdentifier)' == ''">win-x86</PublishRuntimeIdentifier>
+		<RuntimeIdentifier Condition="'$(_IsPublishing)' == 'true'">$(PublishRuntimeIdentifier)</RuntimeIdentifier>
 		<!-- Enables WinForms dialogs (SccHistory/SccProperties) for a nicer UI than MessageBoxW. -->
 		<UseWindowsForms>true</UseWindowsForms>
 		<!--
@@ -34,12 +37,19 @@
 	  <None Remove="MSSCCforGIT.IntegrationTests\**" />
 	</ItemGroup>
 
+	<ItemGroup>
+	  <None Include="MSSCCforGIT.Setup\MSSCCforGIT.Setup.wixproj" />
+	</ItemGroup>
+
 	<!--
 	  Automatically produce the native AOT DLL after a Release build so the output used by
 	  EA (bin\Release\net10.0\win-x86\publish\MSSCCforGIT.dll) is always up to date.
 	  Runs `dotnet publish` as an external process to avoid recursive MSBuild invocation.
+	  Publishes for both win-x86 (32-bit EA, the common case) and win-x64 (64-bit EA) so both
+	  installer variants have fresh output to package.
 	-->
 	<Target Name="PublishNativeAot" AfterTargets="Build" Condition="'$(Configuration)' == 'Release' AND '$(_IsPublishing)' != 'true'">
-		<Exec Command="dotnet publish &quot;$(MSBuildProjectFullPath)&quot; -c $(Configuration) -r win-x86 --self-contained -p:_IsPublishing=true" />
+		<Exec Command="dotnet publish &quot;$(MSBuildProjectFullPath)&quot; -c $(Configuration) -r win-x86 --self-contained -p:_IsPublishing=true -p:PublishRuntimeIdentifier=win-x86" />
+		<Exec Command="dotnet publish &quot;$(MSBuildProjectFullPath)&quot; -c $(Configuration) -r win-x64 --self-contained -p:_IsPublishing=true -p:PublishRuntimeIdentifier=win-x64" />
 	</Target>
 </Project>
