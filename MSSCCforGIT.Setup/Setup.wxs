@@ -14,16 +14,20 @@
 	<?define Win64 = "no" ?>
 	<?define PlatformProgramFilesFolder = "ProgramFilesFolder" ?>
 	<!-- 32-bit EA on 64-bit Windows looks for its SCC provider registration under the WOW6432Node
-		 hive - see RegisterMSSCCforGIT.reg for the equivalent manual registration this mirrors. -->
-	<?define SccRegistryRoot = "SOFTWARE\WOW6432Node\SourceCodeControlProvider\InstalledSCCProviders" ?>
-	<?define BellekensRegistryRoot = "SOFTWARE\WOW6432Node\Bellekens\Bellekens GIT MSSCCI" ?>
+		 hive (see RegisterMSSCCforGIT.reg for the equivalent manual registration). However, the MSI
+		 component in Files.wxs runs in the 32-bit registry view (Win64="no"), so Windows' registry
+		 redirector already redirects these HKLM\SOFTWARE writes to WOW6432Node automatically - the
+		 key paths here must NOT include "WOW6432Node" themselves, or they'd be redirected twice and
+		 end up under SOFTWARE\WOW6432Node\WOW6432Node\..., where EA never looks. -->
+	<?define SccRegistryRoot = "SOFTWARE\SourceCodeControlProvider\InstalledSCCProviders" ?>
+	<?define BellekensRegistryRoot = "SOFTWARE\Bellekens\Bellekens GIT MSSCCI" ?>
 	<?define UpgradeCode = "D045EDD5-3B67-4B68-BDC0-41E992E111A8" ?>
 	<?endif?>
 
 	<Product Id="*"
 		  Name="MSSCCforGIT $(var.PlatformName)"
 		  Language="1033"
-		  Version="1.0.0.0"
+		  Version="1.0.1.0"
 		  UpgradeCode="$(var.UpgradeCode)"
 		  Manufacturer="Bellekens">
 		<Package Description="Installs MSSCCforGIT $(var.PlatformName) on this computer"
@@ -38,14 +42,14 @@
 		<Media Id="1" Cabinet="contents.cab" EmbedCab="yes" CompressionLevel="high"/>
 
 		<Upgrade Id="$(var.UpgradeCode)">
-			<UpgradeVersion Minimum="1.0.0.0"
+			<UpgradeVersion Minimum="1.0.1.0"
 						  IncludeMinimum="no"
 						  OnlyDetect="yes"
 						  Language="1033"
 						  Property="NEWPRODUCTFOUND" />
 			<UpgradeVersion Minimum="0.0.0.0"
 							IncludeMinimum="yes"
-							Maximum="1.0.0.0"
+							Maximum="1.0.1.0"
 							IncludeMaximum="no"
 							Language="1033"
 							Property="UPGRADEFOUND" />

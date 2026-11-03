@@ -14,9 +14,13 @@
 	<?define Win64 = "no" ?>
 	<?define PlatformProgramFilesFolder = "ProgramFilesFolder" ?>
 	<!-- 32-bit EA on 64-bit Windows looks for its SCC provider registration under the WOW6432Node
-		 hive - see RegisterMSSCCforGIT.reg for the equivalent manual registration this mirrors. -->
-	<?define SccRegistryRoot = "SOFTWARE\WOW6432Node\SourceCodeControlProvider\InstalledSCCProviders" ?>
-	<?define BellekensRegistryRoot = "SOFTWARE\WOW6432Node\Bellekens\Bellekens GIT MSSCCI" ?>
+		 hive (see RegisterMSSCCforGIT.reg for the equivalent manual registration). However, the MSI
+		 component below runs in the 32-bit registry view (Win64="no"), so Windows' registry
+		 redirector already redirects these HKLM\SOFTWARE writes to WOW6432Node automatically - the
+		 key paths here must NOT include "WOW6432Node" themselves, or they'd be redirected twice and
+		 end up under SOFTWARE\WOW6432Node\WOW6432Node\..., where EA never looks. -->
+	<?define SccRegistryRoot = "SOFTWARE\SourceCodeControlProvider\InstalledSCCProviders" ?>
+	<?define BellekensRegistryRoot = "SOFTWARE\Bellekens\Bellekens GIT MSSCCI" ?>
 	<?define UpgradeCode = "D045EDD5-3B67-4B68-BDC0-41E992E111A8" ?>
 	<?endif?>
 
@@ -32,8 +36,9 @@
 
 						<!--
 							Registers the provider so EA can discover it (see RegisterMSSCCforGIT.reg for the
-							manual equivalent this mirrors). SccRegistryRoot/BellekensRegistryRoot already
-							account for the WOW6432Node hive on the x86 build (see Setup.wxs).
+							manual equivalent this mirrors). SccRegistryRoot/BellekensRegistryRoot are plain
+							SOFTWARE paths; the Win64="no" setting on this component makes Windows redirect
+							them to WOW6432Node automatically for the x86 build (see note above).
 						-->
 						<Component Id="ProviderRegistryEntry" Guid="A13B6735-1880-4FA6-AD5B-808467CF6ACB" Win64="$(var.Win64)">
 							<RegistryKey Root="HKLM" Key="$(var.SccRegistryRoot)">
