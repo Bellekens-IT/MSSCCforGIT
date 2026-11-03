@@ -113,7 +113,7 @@ public static partial class MsscciExports
     {
         var psi = new System.Diagnostics.ProcessStartInfo
         {
-            FileName = "git",
+            FileName = ResolveGitExecutablePath(),
             ArgumentList = { "commit", "-m", comment },
             WorkingDirectory = workingDirectory,
             UseShellExecute = false,
@@ -151,7 +151,7 @@ public static partial class MsscciExports
     {
         var psi = new System.Diagnostics.ProcessStartInfo
         {
-            FileName = "git",
+            FileName = ResolveGitExecutablePath(),
             ArgumentList = { "push" },
             WorkingDirectory = workingDirectory,
             UseShellExecute = false,
@@ -193,7 +193,7 @@ public static partial class MsscciExports
     {
         var psi = new System.Diagnostics.ProcessStartInfo
         {
-            FileName = "git",
+            FileName = ResolveGitExecutablePath(),
             ArgumentList = { "pull", "origin", branchName },
             WorkingDirectory = workingDirectory,
             UseShellExecute = false,
@@ -318,7 +318,7 @@ public static partial class MsscciExports
             string normalizedPath = repoPath.Replace('\\', '/');
             var psi = new System.Diagnostics.ProcessStartInfo
             {
-                FileName = "git",
+                FileName = ResolveGitExecutablePath(),
                 ArgumentList = { "config", "--global", "--add", "safe.directory", normalizedPath },
                 UseShellExecute = false,
                 CreateNoWindow = true,
@@ -333,5 +333,90 @@ public static partial class MsscciExports
         {
             LogDiagnostic("AddSafeDirectory", ex);
         }
+    }
+
+    private static string? _resolvedGitExecutablePath;
+
+    /// <summary>
+    /// Resolves the full path to "git.exe" to launch via the various *ViaGitCli helpers. We can't
+    /// simply rely on ProcessStartInfo.FileName = "git" and PATH-based lookup: EA (and therefore
+    /// this provider DLL, which runs in-process inside it) may be running with a PATH that doesn't
+    /// include Git for Windows's "cmd" directory, e.g. because it was installed/updated after EA's
+    /// current session started, because it was only added to a different user's PATH, or because
+    /// only a GUI client bundling its own private copy of git (e.g. GitHub Desktop) is installed
+    /// without ever exposing it on PATH at all. Falls back to well-known install locations used by
+    /// Git for Windows and GitHub Desktop's bundled git before giving up and returning the bare
+    /// "git" command name (so the resulting error message at least still mentions git).
+    /// </summary>
+    private static string ResolveGitExecutablePath()
+    {
+        if (_resolvedGitExecutablePath != null)
+        {
+            return _resolvedGitExecutablePath;
+        }
+
+        // 1. Prefer whatever "git" resolves to on PATH, if anything - this picks up the user's
+        // normal Git for Windows installation without needing any special-casing.
+        string? pathEnv = Environment.GetEnvironmentVariable("PATH");
+        if (!string.IsNullOrEmpty(pathEnv))
+        {
+            foreach (string directory in pathEnv.Split(Path.PathSeparator))
+            {
+                if (string.IsNullOrWhiteSpace(directory)) continue;
+
+                string candidate = Path.Combine(directory.Trim(), "git.exe");
+                if (File.Exists(candidate))
+                {
+                    return _resolvedGitExecutablePath = candidate;
+                }
+            }
+        }
+
+        // 2. Fall back to well-known install locations, since PATH may not reflect the git
+        // installation visible to an interactive terminal (e.g. EA started before PATH was
+        // updated, or git only added to a different user's PATH).
+        string[] fallbackCandidates =
+        [
+            Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles), "Git", "cmd", "git.exe"),
+            Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ProgramFilesX86), "Git", "cmd", "git.exe"),
+            Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "Programs", "Git", "cmd", "git.exe"),
+        ];
+
+        foreach (string candidate in fallbackCandidates)
+        {
+            if (File.Exists(candidate))
+            {
+                return _resolvedGitExecutablePath = candidate;
+            }
+        }
+
+        // 3. GitHub Desktop bundles its own private copy of git under a version-numbered
+        // "resources\app\git\cmd" directory, e.g. for a user who only has GitHub Desktop installed
+        // (no standalone Git for Windows) and no git.exe on PATH at all.
+        string githubDesktopRoot = Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "GitHubDesktop");
+        try
+        {
+            if (Directory.Exists(githubDesktopRoot))
+            {
+                foreach (string appDir in Directory.EnumerateDirectories(githubDesktopRoot, "app-*"))
+                {
+                    string candidate = Path.Combine(appDir, "resources", "app", "git", "cmd", "git.exe");
+                    if (File.Exists(candidate))
+                    {
+                        return _resolvedGitExecutablePath = candidate;
+                    }
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            LogDiagnostic("ResolveGitExecutablePath", ex);
+        }
+
+        // 4. Nothing found; fall back to the bare command name so the resulting Win32Exception at
+        // least still names "git" rather than an empty string.
+        LogDiagnostic("ResolveGitExecutablePath", new Exception("Could not locate git.exe on PATH or in well-known install locations; falling back to 'git'."));
+        return _resolvedGitExecutablePath = "git";
     }
 }

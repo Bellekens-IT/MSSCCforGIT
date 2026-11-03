@@ -60,7 +60,7 @@ public static partial class MsscciExports
     {
         var psi = new System.Diagnostics.ProcessStartInfo
         {
-            FileName = "git",
+            FileName = ResolveGitExecutablePath(),
             ArgumentList =
             {
                 "log", "--follow", "--date=short",
