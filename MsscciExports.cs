@@ -254,6 +254,19 @@ public static partial class MsscciExports
             s_projectRootsByContext[pContext] = candidatePath!;
             s_lastOpenedProjectRoot = candidatePath;
 
+            // Pull the latest changes from the remote as soon as the project is opened, so EA
+            // starts off with an up-to-date working directory rather than only syncing lazily on
+            // individual file operations.
+            try
+            {
+                using var repo = OpenRepositoryEnsuringSafeDirectory(discovered);
+                PullViaGitCli(repo.Info.WorkingDirectory, repo.Head.FriendlyName);
+            }
+            catch (Exception pullEx)
+            {
+                LogDiagnostic("SccOpenProject.Pull", pullEx);
+            }
+
             return SCC_OK;
         }
         catch (Exception ex)
