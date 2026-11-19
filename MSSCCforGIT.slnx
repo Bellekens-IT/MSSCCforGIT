@@ -1,5 +1,8 @@
 <Solution>
   <Project Path="MSSCCforGIT.csproj" />
   <Project Path="MSSCCforGIT.IntegrationTests\MSSCCforGIT.IntegrationTests.csproj" />
-  <Project Path="MSSCCforGIT.Setup\MSSCCforGIT.Setup.wixproj" />
+  <Project Path="MSSCCforGIT.Setup\MSSCCforGIT.Setup.wixproj">
+    <Platform Project="x64" />
+    <Build />
+  </Project>
 </Solution>

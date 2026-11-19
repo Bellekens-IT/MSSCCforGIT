@@ -47,6 +47,9 @@ public static partial class MsscciExports
 
         try
         {
+            var isRooted = Path.IsPathRooted(filePath);
+            var fileExists = File.Exists(filePath);
+            var dirExists = Directory.Exists(filePath);
             if (Path.IsPathRooted(filePath) && (File.Exists(filePath) || Directory.Exists(filePath)))
             {
                 return filePath;
@@ -96,7 +99,44 @@ public static partial class MsscciExports
         if (rawPtr == IntPtr.Zero) return "";
         return Marshal.PtrToStringAnsi(rawPtr) ?? "";
     }
+    private static unsafe string getFilePath(IntPtr rawPrt)
+    { 
+        var filePath = ReadPlainAnsiString(rawPrt);
+        if (!IsValidEaFilePath(filePath))
+        {
+            filePath = s_lastQueryInfoResolvedPath;
+        }
+        return filePath ?? "";
+    }
 
+    /// <summary>
+    /// Validates that a candidate file path looks like a genuine, fully-formed path rather than a
+    /// garbage/truncated string (e.g. "C:\Users&"): it must be rooted, its directory must exist on
+    /// disk, and it must have one of the expected EA file extensions (.xml or .xmi).
+    /// </summary>
+    private static bool IsValidEaFilePath(string? filePath)
+    {
+        if (string.IsNullOrEmpty(filePath) || !Path.IsPathRooted(filePath)) return false;
+
+        try
+        {
+            string? directory = Path.GetDirectoryName(filePath);
+            if (string.IsNullOrEmpty(directory) || !Directory.Exists(directory)) return false;
+
+            string extension = Path.GetExtension(filePath);
+            if (!extension.Equals(".xml", StringComparison.OrdinalIgnoreCase) &&
+                !extension.Equals(".xmi", StringComparison.OrdinalIgnoreCase))
+            {
+                return false;
+            }
+        }
+        catch
+        {
+            return false;
+        }
+
+        return true;
+    }
     /// <summary>
     /// Reads a file name pointer as passed by EA. EA's lpFileNames buffers are frequently
     /// truncated/corrupted at the exact address given (e.g. only 'C:\Users' or similar garbage),

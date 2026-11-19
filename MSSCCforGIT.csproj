@@ -33,12 +33,14 @@
 
 	<ItemGroup>
 	  <Compile Remove="MSSCCforGIT.IntegrationTests\**" />
+	  <Compile Remove="MSSCCforGIT.Setup\**" />
+	  <Compile Remove="Test\**" />
 	  <EmbeddedResource Remove="MSSCCforGIT.IntegrationTests\**" />
+	  <EmbeddedResource Remove="MSSCCforGIT.Setup\**" />
+	  <EmbeddedResource Remove="Test\**" />
 	  <None Remove="MSSCCforGIT.IntegrationTests\**" />
-	</ItemGroup>
-
-	<ItemGroup>
-	  <None Include="MSSCCforGIT.Setup\MSSCCforGIT.Setup.wixproj" />
+	  <None Remove="MSSCCforGIT.Setup\**" />
+	  <None Remove="Test\**" />
 	</ItemGroup>
 
 	<!--
@@ -51,5 +53,35 @@
 	<Target Name="PublishNativeAot" AfterTargets="Build" Condition="'$(Configuration)' == 'Release' AND '$(_IsPublishing)' != 'true'">
 		<Exec Command="dotnet publish &quot;$(MSBuildProjectFullPath)&quot; -c $(Configuration) -r win-x86 --self-contained -p:_IsPublishing=true -p:PublishRuntimeIdentifier=win-x86" />
 		<Exec Command="dotnet publish &quot;$(MSBuildProjectFullPath)&quot; -c $(Configuration) -r win-x64 --self-contained -p:_IsPublishing=true -p:PublishRuntimeIdentifier=win-x64" />
+		<CallTarget Targets="RegisterSccProvider" />
+	</Target>
+
+	<!--
+	  Debug-config equivalent of PublishNativeAot
+	  and no/minimal optimization (Configuration=Debug flows into the publish, which disables
+	  Optimize) under bin\Debug\net10.0-windows\<rid>\publish\MSSCCforGIT.dll, for use when
+	  attaching Visual Studio's native debugger to EA.exe. Only publishes win-x86 by default
+	  since EA is normally 32-bit; pass -p:PublishRuntimeIdentifier=win-x64 to `dotnet publish`
+	  directly if you need the 64-bit variant.
+	-->
+	<Target Name="PublishNativeAotDebug" AfterTargets="Build" Condition="'$(Configuration)' == 'Debug' AND '$(_IsPublishing)' != 'true'">
+		<Exec Command="dotnet publish &quot;$(MSBuildProjectFullPath)&quot; -c $(Configuration) -r win-x86 --self-contained -p:_IsPublishing=true -p:PublishRuntimeIdentifier=win-x86" />
+		<CallTarget Targets="RegisterSccProvider" />
+	</Target>
+
+	<!--
+	  Repoints the live SCCServerPath registry value (HKLM\SOFTWARE\WOW6432Node\Bellekens\Bellekens
+	  GIT MSSCCI, the 32-bit hive EA itself looks up on 64-bit Windows) at the win-x86 Native AOT
+	  publish output of whichever configuration was just built, so EA.exe always loads the DLL that
+	  matches the last build (Debug build -> Debug DLL with full PDBs/no optimizations; Release
+	  build -> Release DLL), without any manual regedit/reg.exe step. This only ever repoints the
+	  existing provider registration - it never creates it from scratch; run RegisterMSSCCforGIT.reg
+	  at least once first (as a local admin) so the provider key already exists.
+	  Uses reg.exe directly rather than editing RegisterMSSCCforGIT.reg so the install-time Release
+	  registration file is left untouched. Requires running Visual Studio elevated (as the HKLM key
+	  is otherwise not writable); the Exec fails harmlessly with a clear reg.exe error if not elevated.
+	-->
+	<Target Name="RegisterSccProvider">
+		<Exec Command="reg add &quot;HKLM\SOFTWARE\WOW6432Node\Bellekens\Bellekens GIT MSSCCI&quot; /v SCCServerPath /t REG_SZ /d &quot;$(MSBuildProjectDirectory)\bin\$(Configuration)\net10.0-windows\win-x86\publish\MSSCCforGIT.dll&quot; /f" />
 	</Target>
 </Project>

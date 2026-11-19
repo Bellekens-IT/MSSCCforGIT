@@ -112,7 +112,7 @@ public static partial class MsscciExports
 
             for (int i = 0; i < nFiles; i++)
             {
-                string filePath = ResolveEaPath(ReadPlainAnsiString((IntPtr)lpFileNames[i]), pContext);
+                string filePath = getFilePath((IntPtr)lpFileNames[i]);
 
                 string? repoPath = DiscoverRepositoryPath(filePath);
                 LogDiagnostic("SccCheckin", new Exception($"filePath='{filePath}' repoPath='{repoPath}'"));

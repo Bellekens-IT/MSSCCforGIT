@@ -87,20 +87,7 @@ public static partial class MsscciExports
         {
             for (int i = 0; i < nFiles; i++)
             {
-                // EA reliably calls SccQueryInfo for a file immediately before calling SccAdd for
-                // that same file (confirmed via diagnostics), and that call's path resolution has
-                // proven completely reliable. SccAdd's own file-name pointer, by contrast, has
-                // proven unreliable to scan directly (EA's buffer layout for it varies across calls
-                // and doesn't always contain the real path), so we no longer attempt that at all and
-                // rely solely on the path cached from the preceding SccQueryInfo call.
-                if (s_lastQueryInfoResolvedPath == null ||
-                    DateTime.UtcNow - s_lastQueryInfoResolvedAt >= TimeSpan.FromSeconds(5))
-                {
-                    LogDiagnostic("AddCore", new Exception($"index={i} skipped: no recent SccQueryInfo-resolved path available"));
-                    continue;
-                }
-
-                string filePath = s_lastQueryInfoResolvedPath;
+                string filePath = getFilePath((IntPtr)lpFileNames[i]);
 
                 bool keepCheckedOut = pFlags != null && (pFlags[i] & SCC_FILE_KEEPCHECKEDOUT) != 0;
 
@@ -166,8 +153,8 @@ public static partial class MsscciExports
 
         try
         {
-            string oldPath = ResolveEaPath(ReadPlainAnsiString((IntPtr)lpFileName), pContext);
-            string newPath = ResolveEaPath(ReadPlainAnsiString((IntPtr)lpNewName), pContext);
+            string oldPath = getFilePath((IntPtr)lpFileName);
+            string newPath = getFilePath((IntPtr)lpNewName);
 
             string? repoPath = DiscoverRepositoryPath(oldPath);
             if (repoPath == null) return SCC_E_FILENOTCONTROLLED;
@@ -197,6 +184,10 @@ public static partial class MsscciExports
     /// took effect, and fails with an error if it doesn't come back as checked out - so the file
     /// is recorded in s_keptCheckedOutFiles (the same mechanism SccAdd's "keep checked out" option
     /// uses) until a real SccCheckin/SccUncheckout clears it.
+    /// Before marking the file as checked out, we first pull the latest version from the remote so
+    /// the user starts from an up-to-date copy. If the file doesn't exist locally yet (e.g. it was
+    /// added remotely after this repository was last synced), we pull the whole repository and then
+    /// check again whether the file exists.
     /// </summary>
     [UnmanagedCallersOnly(EntryPoint = "SccCheckout", CallConvs = new[] { typeof(CallConvStdcall) })]
     public static unsafe int SccCheckout(
@@ -212,6 +203,14 @@ public static partial class MsscciExports
 
         return ForEachFileRepo(nFiles, lpFileNames, pContext, (repo, filePath) =>
         {
+            PullViaGitCli(repo.Info.WorkingDirectory, repo.Head.FriendlyName);
+
+            if (!File.Exists(filePath))
+            {
+                LogDiagnostic("SccCheckout", new Exception($"filePath='{filePath}' not found after pull; retrying with a fresh pull of the whole repository."));
+                PullViaGitCli(repo.Info.WorkingDirectory, repo.Head.FriendlyName);
+            }
+
             s_keptCheckedOutFiles[filePath] = 0;
         });
     }
@@ -260,7 +259,7 @@ public static partial class MsscciExports
         {
             for (int i = 0; i < nFiles; i++)
             {
-                string filePath = ResolveEaPath(ReadPlainAnsiString((IntPtr)lpFileNames[i]), pContext);
+                string filePath = getFilePath((IntPtr)lpFileNames[i]);
 
                 string? repoPath = DiscoverRepositoryPath(filePath);
                 LogDiagnostic("GetCore", new Exception($"filePath='{filePath}' repoPath='{repoPath}'"));
@@ -301,7 +300,7 @@ public static partial class MsscciExports
             for (int i = 0; i < nFiles; i++)
             {
                 IntPtr rawPtr = (IntPtr)lpFileNames[i];
-                string filePath = ResolveEaPath(ReadFileNamePointer(rawPtr), pContext);
+                string filePath = getFilePath(rawPtr);
 
                 // Remember this resolved path as a fallback for the SccAdd call EA typically issues
                 // immediately afterward for the same file, in case that call's own pointer scan
@@ -389,7 +388,7 @@ public static partial class MsscciExports
             for (int i = 0; i < nFiles; i++)
             {
                 IntPtr rawPtr = (IntPtr)lpFileNames[i];
-                string filePath = ResolveEaPath(ReadPlainAnsiString(rawPtr), pContext);
+                string filePath = getFilePath(rawPtr);
 
                 // This call's own lpFileNames pointer has proven just as unreliable to read
                 // directly as SccAdd's (EA's buffer layout for it varies across calls and

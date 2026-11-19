@@ -25,7 +25,7 @@ public static partial class MsscciExports
         {
             for (int i = 0; i < nFiles; i++)
             {
-                string filePath = ResolveEaPath(ReadPlainAnsiString((IntPtr)lpFileNames[i]), pContext);
+                string filePath = getFilePath((IntPtr)lpFileNames[i]);
 
                 string? repoPath = DiscoverRepositoryPath(filePath);
                 LogDiagnostic("SccHistory", new Exception($"filePath='{filePath}' repoPath='{repoPath}'"));
@@ -125,7 +125,7 @@ public static partial class MsscciExports
     {
         try
         {
-            string filePath = ResolveEaPath(ReadPlainAnsiString((IntPtr)lpFileName), pContext);
+            string filePath = getFilePath((IntPtr)lpFileName);
 
             string? repoPath = DiscoverRepositoryPath(filePath);
             LogDiagnostic("SccProperties", new Exception($"filePath='{filePath}' repoPath='{repoPath}'"));
@@ -173,7 +173,7 @@ public static partial class MsscciExports
 
             if (nFiles > 0 && lpFileNames != null)
             {
-                string filePath = ResolveEaPath(ReadPlainAnsiString((IntPtr)lpFileNames[0]), pContext);
+                string filePath = getFilePath((IntPtr)lpFileNames[0]);
                 repoPath = DiscoverRepositoryPath(filePath);
             }
 
