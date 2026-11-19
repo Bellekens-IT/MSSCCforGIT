@@ -201,16 +201,10 @@ public static partial class MsscciExports
     {
         LogDiagnostic("SccCheckout.Entry", new Exception($"nFiles={nFiles} fOptions=0x{fOptions:X}"));
 
+        
         return ForEachFileRepo(nFiles, lpFileNames, pContext, (repo, filePath) =>
         {
             PullViaGitCli(repo.Info.WorkingDirectory, repo.Head.FriendlyName);
-
-            if (!File.Exists(filePath))
-            {
-                LogDiagnostic("SccCheckout", new Exception($"filePath='{filePath}' not found after pull; retrying with a fresh pull of the whole repository."));
-                PullViaGitCli(repo.Info.WorkingDirectory, repo.Head.FriendlyName);
-            }
-
             s_keptCheckedOutFiles[filePath] = 0;
         });
     }
@@ -335,6 +329,22 @@ public static partial class MsscciExports
                 else
                 {
                     FileStatus fileStatus = repo.RetrieveStatus(relativePath);
+
+                    if (fileStatus.HasFlag(FileStatus.Nonexistent))
+                    {
+                        // The file doesn't exist on disk at all - this can happen if it was added
+                        // to the remote after this repository was last synced, so before reporting
+                        // it as uncontrolled, pull the latest changes and re-check its status.
+                        try
+                        {
+                            PullViaGitCli(repo.Info.WorkingDirectory, repo.Head.FriendlyName);
+                            fileStatus = repo.RetrieveStatus(relativePath);
+                        }
+                        catch (Exception ex)
+                        {
+                            LogDiagnostic("SccQueryInfo.Pull", ex);
+                        }
+                    }
 
                     if (fileStatus.HasFlag(FileStatus.NewInWorkdir) || fileStatus.HasFlag(FileStatus.Nonexistent))
                     {
